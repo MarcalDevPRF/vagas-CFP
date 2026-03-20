@@ -1,5 +1,6 @@
 flask==3.0.0
 flask-cors==4.0.0
-pandas==2.1.1
+pandas==2.1.4
+numpy==1.26.4
 reportlab==4.0.4
 gunicorn==21.2.0
