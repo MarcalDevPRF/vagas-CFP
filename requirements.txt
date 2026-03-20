@@ -3,4 +3,3 @@ flask-cors==4.0.0
 pandas==2.1.1
 reportlab==4.0.4
 gunicorn==21.2.0
-python-3.11.9
