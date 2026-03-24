@@ -148,7 +148,7 @@ def carregar_respostas(df: pd.DataFrame) -> tuple:
     df.columns = df.columns.str.strip()
 
     # Inscrição
-    col_insc = _col(df, "inscrição_aluno", "inscricao_aluno", "inscrição", "inscricao")
+    col_insc = _col(df, "inscricao-aluno", "inscrição-aluno", "inscricao_aluno", "inscrição_aluno", "inscrição", "inscricao")
     if not col_insc:
         raise ValueError("Coluna de inscrição não encontrada em respostas.csv")
     df = df.rename(columns={col_insc: "Inscrição"})
@@ -266,16 +266,25 @@ def alocar_candidato(cand, escolha, saldo_vagas, opcao_cols):
                       obs=f"Sem vaga nas {len(opcoes)} opções informadas")
 
 
+def _norm_insc(val):
+    """Normaliza inscrição: remove .0 de leitura float, faz strip."""
+    s = str(val).strip()
+    return s[:-2] if s.endswith(".0") else s
+
+
 def processar_alocacao(df_alunos_raw, df_respostas_raw, df_vagas_raw):
     classif               = carregar_alunos(df_alunos_raw)
     saldo_vagas, vagas_orig = carregar_vagas(df_vagas_raw)
     respostas, opcao_cols = carregar_respostas(df_respostas_raw)
 
-    idx        = respostas.set_index("Inscrição")
+    # Normaliza inscrição dos dois lados para garantir o match
+    classif["inscricao_aluno"] = classif["inscricao_aluno"].apply(_norm_insc)
+    respostas["Inscricao_norm"] = respostas["Inscrição"].apply(_norm_insc)
+    idx        = respostas.set_index("Inscricao_norm")
     resultados = []
 
     for _, cand in classif.iterrows():                  # R1 — ordem da classificação
-        insc    = str(cand["inscricao_aluno"])
+        insc    = _norm_insc(cand["inscricao_aluno"])
         escolha = idx.loc[insc].to_dict() if insc in idx.index else None
 
         resultado = alocar_candidato(cand, escolha, saldo_vagas, opcao_cols)
@@ -560,6 +569,26 @@ def analise():
     meta = json.loads(META_JSON.read_text())
     return jsonify({"ok": True, "certame": meta.get("certame"),
                     "rodada_ts": meta["rodada_ts"], **meta["analise"]})
+
+
+@app.post("/debug")
+def debug():
+    """Devolve colunas e primeiras 3 linhas de cada CSV recebido."""
+    resultado = {}
+    for campo in ("alunos", "respostas", "vagas"):
+        if campo not in request.files:
+            resultado[campo] = {"erro": "arquivo ausente"}
+            continue
+        try:
+            df = _csv_to_df(request.files[campo])
+            resultado[campo] = {
+                "colunas": list(df.columns),
+                "linhas":  df.head(3).to_dict(orient="records"),
+                "total":   len(df),
+            }
+        except Exception as e:
+            resultado[campo] = {"erro": str(e)}
+    return jsonify(resultado)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
