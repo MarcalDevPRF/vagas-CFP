@@ -136,40 +136,30 @@ def carregar_alunos(df: pd.DataFrame) -> pd.DataFrame:
 
 def montar_classificacao_final(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Recebe o DataFrame de alunos já normalizado e devolve a lista final
-    ordenada com posicao_final atribuída, seguindo:
+    Monta a lista final de classificação com alternância e proporcionalidade.
 
-    1. Separação em 3 listas de REGULARES ordenadas por nota DESC,
-       desempate por data_nascimento ASC (mais velho = mais novo na data = melhor):
-         - lista_ampla    → concorrencia_aluno == "AMPLA"
-         - lista_negro    → concorrencia_aluno == "COTA_NEGRO"
-         - lista_pcd      → concorrencia_aluno == "COTA_PCD"
+    REGULARES:
+      - 3 listas separadas por concorrência, ordenadas por nota DESC
+        e desempate por data_nascimento ASC (mais velho = prioridade)
+      - Relógio de posições reservadas:
+          Pos 3, 8, 13, 18, 23... → COTA_NEGRO  (de 5 em 5, a partir de 3)
+          Pos 5, 21, 41, 61, 81...→ COTA_PCD    (5 fixo, depois de 20 em 20)
+          Demais → AMPLA
+      - Se a cota reservada estiver esgotada → AMPLA preenche
+      - Continua até todas as listas se esgotarem
 
-    2. Montagem da fila por alternância (relógio):
-         - Posições 3, 8, 13, 18, 23... → COTA_NEGRO
-         - Posições 5, 21, 41, 61, 81... → COTA_PCD  (a partir de 5, de 20 em 20)
-         - Demais → AMPLA
-       Se a cota chamada estiver esgotada, usa AMPLA no lugar.
-
-    3. Inserção dos SUBJUDICE (vaga espelho):
-       - Cada SUBJUDICE é inserido na posição equivalente à sua nota na lista
-         REGULAR correspondente, sem deslocar as posições ordinais dos REGULARES.
-       - SUBJUDICE com mesma nota de um REGULAR → mesma posicao_final (espelho).
-       - SUBJUDICE sem empate → posicao_final igual ao REGULAR imediatamente
-         abaixo (nota superior mais próxima).
-       - SUBJUDICE nunca desloca REGULAR.
+    SUBJUDICE (vaga espelho):
+      - Cada SUBJUDICE recebe a mesma posicao_final do REGULAR
+        imediatamente de nota igual ou superior mais próxima
+      - Nunca desloca a numeração ordinal dos REGULARES
     """
-    import math
-
     # ── Separar REGULARES e SUBJUDICE ────────────────────────────────────────
     regulares  = df[df["situacao_aluno"] == "REGULAR"].copy()
     subjudices = df[df["situacao_aluno"] == "SUBJUDICE"].copy()
 
-    # ── Ordenar cada lista de REGULARES: nota DESC, nascimento ASC (mais velho primeiro)
+    # ── Ordenar cada lista: nota DESC, nascimento ASC ────────────────────────
     def ordenar_lista(sub_df):
         sub_df = sub_df.copy()
-        # Para desempate: data_nascimento ASC (mais velho = data menor = prioridade)
-        # Candidatos sem data ficam por último no desempate
         sub_df["_nasc_sort"] = sub_df["data_nascimento"].apply(
             lambda d: d if pd.notna(d) else pd.Timestamp("2099-01-01")
         )
@@ -177,104 +167,95 @@ def montar_classificacao_final(df: pd.DataFrame) -> pd.DataFrame:
             ["pontuacao", "_nasc_sort"], ascending=[False, True]
         ).reset_index(drop=True)
 
-    lista_ampla = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "AMPLA"])
-    lista_negro = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_NEGRO"])
-    lista_pcd   = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_PCD"])
-
-    # Ponteiros para cada lista
+    listas = {
+        "AMPLA":      ordenar_lista(regulares[regulares["concorrencia_aluno"] == "AMPLA"]),
+        "COTA_NEGRO": ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_NEGRO"]),
+        "COTA_PCD":   ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_PCD"]),
+    }
     ptr = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
-    listas = {"AMPLA": lista_ampla, "COTA_NEGRO": lista_negro, "COTA_PCD": lista_pcd}
 
-    total_regulares = len(regulares)
-
-    # ── Determinar tipo de cada posição (relógio) ─────────────────────────────
+    # ── Relógio: tipo de cada posição ─────────────────────────────────────────
     def tipo_posicao(pos):
-        """pos é 1-based. Retorna 'COTA_NEGRO', 'COTA_PCD' ou 'AMPLA'."""
-        # PcD: posições 5, 21, 41, 61, 81... (5 fixo, depois de 20 em 20 a partir de 21)
+        # PcD: 5, 21, 41, 61... (5 fixo + de 20 em 20 a partir de 21)
         if pos == 5 or (pos >= 21 and (pos - 21) % 20 == 0):
             return "COTA_PCD"
-        # Negro: posições 3, 8, 13, 18, 23... (de 5 em 5, começando em 3)
+        # Negro: 3, 8, 13, 18, 23... (de 5 em 5 a partir de 3)
         if (pos - 3) >= 0 and (pos - 3) % 5 == 0:
             return "COTA_NEGRO"
         return "AMPLA"
 
     # ── Montar fila de REGULARES ──────────────────────────────────────────────
-    fila_regular = []   # lista de dicts com posicao_final + dados do candidato
-    pos_ordinal  = 0    # contador de posição ordinal (só sobe com REGULAR)
+    fila_regular = []
+    pos_ordinal  = 0
 
-    while sum(ptr[k] < len(listas[k]) for k in ptr) > 0:
+    # Continua enquanto houver candidatos em QUALQUER lista
+    while any(ptr[k] < len(listas[k]) for k in ptr):
         pos_ordinal += 1
-        tipo = tipo_posicao(pos_ordinal)
+        tipo_ideal = tipo_posicao(pos_ordinal)
 
-        # Se a cota chamada está esgotada, usa AMPLA
-        if ptr[tipo] >= len(listas[tipo]):
+        # Tenta o tipo ideal; se esgotado, tenta AMPLA; se AMPLA esgotada,
+        # tenta qualquer cota restante
+        if ptr[tipo_ideal] < len(listas[tipo_ideal]):
+            tipo = tipo_ideal
+        elif ptr["AMPLA"] < len(listas["AMPLA"]):
             tipo = "AMPLA"
-
-        # Se AMPLA também esgotou, encerra
-        if ptr[tipo] >= len(listas[tipo]):
-            break
+        else:
+            # Busca qualquer lista não esgotada
+            tipo = next((k for k in ["COTA_NEGRO", "COTA_PCD"] if ptr[k] < len(listas[k])), None)
+            if tipo is None:
+                break
 
         cand = listas[tipo].iloc[ptr[tipo]].to_dict()
         ptr[tipo] += 1
-        cand["posicao_final"]   = pos_ordinal
-        cand["tipo_vaga"]       = tipo
+        cand["posicao_final"] = pos_ordinal
+        cand["tipo_vaga"]     = tipo
         fila_regular.append(cand)
 
-    df_regular = pd.DataFrame(fila_regular) if fila_regular else pd.DataFrame()
-
     # ── Inserir SUBJUDICE (vaga espelho) ──────────────────────────────────────
-    # Para cada SUBJUDICE, encontrar a posicao_final do REGULAR com nota
-    # imediatamente igual ou superior.
-    resultado_final = []
+    resultado_final = list(fila_regular)  # começa com todos os regulares
 
-    if df_regular.empty:
-        # Sem regulares, todos subjudice ficam com posição sequencial
-        for i, (_, s) in enumerate(subjudices.iterrows(), 1):
-            row = s.to_dict()
-            row["posicao_final"] = i
-            row["tipo_vaga"]     = row.get("concorrencia_aluno", "AMPLA")
-            resultado_final.append(row)
-    else:
-        # Adicionar todos os regulares
-        for row in fila_regular:
-            resultado_final.append(dict(row))
+    for _, subj in subjudices.iterrows():
+        row       = subj.to_dict()
+        nota_subj = float(row.get("pontuacao", 0) or 0)
 
-        # Para cada subjudice, determinar sua posição espelho
-        for _, subj in subjudices.iterrows():
-            row = subj.to_dict()
-            nota_subj = row.get("pontuacao", 0)
+        # Encontra o REGULAR com nota igual ou imediatamente superior (mais próxima acima)
+        # → SUBJUDICE recebe a mesma posicao_final desse REGULAR
+        candidatos_acima = [
+            r for r in fila_regular
+            if float(r.get("pontuacao", 0) or 0) >= nota_subj
+        ]
+        if candidatos_acima:
+            # O de menor nota entre os que estão acima = mais próximo abaixo do subj
+            espelho = min(candidatos_acima, key=lambda r: float(r.get("pontuacao", 0) or 0))
+            row["posicao_final"] = espelho["posicao_final"]
+        else:
+            # Nota maior que todos os regulares → posição 1
+            row["posicao_final"] = 1
 
-            # Encontrar o REGULAR com nota superior mais próxima (ou igual)
-            # → posição espelho = posicao_final desse REGULAR
-            regulares_acima = [
-                r for r in fila_regular
-                if r.get("pontuacao", 0) >= nota_subj
-            ]
-            if regulares_acima:
-                # Pegar o de menor nota entre os que estão acima (mais próximo)
-                espelho = min(regulares_acima, key=lambda r: r["pontuacao"])
-                row["posicao_final"] = espelho["posicao_final"]
-            else:
-                # Nota maior que todos os regulares → posição 1 (antes de todos)
-                row["posicao_final"] = 1
-
-            row["tipo_vaga"] = row.get("concorrencia_aluno", "AMPLA")
-            resultado_final.append(row)
+        row["tipo_vaga"] = row.get("concorrencia_aluno", "AMPLA")
+        resultado_final.append(row)
 
     df_final = pd.DataFrame(resultado_final)
 
-    # ── Ordenar: posicao_final ASC, REGULAR antes de SUBJUDICE, nota DESC ────
-    df_final["_ordem_sit"] = df_final["situacao_aluno"].apply(
+    if df_final.empty:
+        return df_final
+
+    # ── Ordenação final:
+    #    1. posicao_final ASC
+    #    2. REGULAR antes de SUBJUDICE na mesma posição
+    #    3. nota DESC (para desempate entre SUBJUDICEs na mesma posição)
+    df_final["_ord_sit"] = df_final["situacao_aluno"].apply(
         lambda s: 0 if s == "REGULAR" else 1
     )
     df_final = df_final.sort_values(
-        ["posicao_final", "_ordem_sit", "pontuacao"],
+        ["posicao_final", "_ord_sit", "pontuacao"],
         ascending=[True, True, False]
     ).reset_index(drop=True)
 
     # Limpar colunas auxiliares
     df_final = df_final.drop(
-        columns=[c for c in ["_nasc_sort", "_ordem_sit"] if c in df_final.columns]
+        columns=[c for c in ["_nasc_sort", "_ord_sit"] if c in df_final.columns],
+        errors="ignore"
     )
 
     return df_final
