@@ -8,16 +8,12 @@ from datetime import datetime
 from flask import Flask, jsonify, request, send_file, abort
 
 app = Flask(__name__)
-WORKDIR = Path(os.environ.get("LOTACAO_WORKDIR", "/tmp/lotacao"))
+WORKDIR = Path("/tmp/lotacao")
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
 SAIDA_CSV  = WORKDIR / "resultado_lotacao.csv"
-META_JSON  = WORKDIR / "ultima_rodada.json"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. UTILITÁRIOS DE MAPEAMENTO
-# ─────────────────────────────────────────────────────────────────────────────
-
+# --- AUXILIARES ---
 def _col(df, *nomes):
     mapa = {c.lower().strip(): c for c in df.columns}
     for n in nomes:
@@ -27,31 +23,21 @@ def _col(df, *nomes):
 def carregar_vagas_dict(df):
     unid_col = _col(df, "unidade", "nome_unidade")
     vaga_col = _col(df, "vagas", "quantidade")
+    if not unid_col or not vaga_col: return {}
     return dict(zip(df[unid_col].astype(str).str.upper(), 
                     pd.to_numeric(df[vaga_col], errors="coerce").fillna(0).astype(int)))
 
 def carregar_respostas_map(df):
-    """Lê a aba de respostas atuais, garantindo unicidade por inscrição."""
-    c_insc = _col(df, "inscricao_aluno", "inscricao", "inscrição", "Inscrição_aluno")
-    if not c_insc:
-        raise ValueError("Coluna de inscrição não encontrada em respostas.csv")
-    
-    # Normalização da chave de busca
+    c_insc = _col(df, "inscricao_aluno", "inscricao", "inscrição")
+    if not c_insc: return {}
+    # Normalização e remoção de duplicatas (Ponto crucial para evitar Erro 500)
     df["insc_norm"] = df[c_insc].astype(str).str.replace(".0", "", regex=False).str.strip()
-    
-    # Trava de segurança: mesmo na aba 'atual', removemos duplicatas se houverem
     df = df.drop_duplicates(subset=["insc_norm"], keep="last")
-    
     return df.set_index("insc_norm").to_dict(orient="index")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. RECLASSIFICAÇÃO (MÉRITO + COTAS + VAGA ESPELHO)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def preparar_listas_por_merito(df):
-    df.columns = df.columns.str.strip()
+# --- LÓGICA DE FILA ÚNICA ---
+def preparar_listas(df):
     c_insc = _col(df, "inscricao_aluno", "inscricao")
-    c_nome = _col(df, "nome_aluno", "nome")
     c_nota = _col(df, "pontuacao", "pontos", "nota")
     c_nasc = _col(df, "data_nascimento", "nascimento")
     c_conc = _col(df, "concorrencia_aluno", "concorrencia")
@@ -59,16 +45,14 @@ def preparar_listas_por_merito(df):
 
     df_p = pd.DataFrame()
     df_p["insc"] = df[c_insc].astype(str).str.replace(".0", "", regex=False).str.strip()
-    df_p["nome"] = df[c_nome].astype(str).str.strip() if c_nome else "Sem Nome"
+    df_p["nome"] = df[_col(df, "nome_aluno", "nome") or df.columns[0]].astype(str)
     df_p["nota"] = pd.to_numeric(df[c_nota], errors="coerce").fillna(0)
     df_p["nasc"] = pd.to_datetime(df[c_nasc], dayfirst=True, errors="coerce")
     df_p["conc"] = df[c_conc].astype(str).str.upper().fillna("AMPLA")
     df_p["sit"]  = df[c_sit].astype(str).str.upper().fillna("REGULAR")
-    
     df_p["nasc_sort"] = df_p["nasc"].fillna(pd.Timestamp("2099-12-31"))
     
-    def ordenar(sub_df):
-        return sub_df.sort_values(["nota", "nasc_sort"], ascending=[False, True]).reset_index(drop=True)
+    def ordenar(sub): return sub.sort_values(["nota", "nasc_sort"], ascending=[False, True]).reset_index(drop=True)
 
     return {
         "AMPLA": ordenar(df_p[df_p["conc"] == "AMPLA"]),
@@ -76,130 +60,68 @@ def preparar_listas_por_merito(df):
         "COTA_PCD": ordenar(df_p[df_p["conc"] == "COTA_PCD"])
     }
 
-def gerar_fila_unica(listas):
+def gerar_fila(listas):
     ptr = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
-    fila_final = []
-    pos_ordinal = 1 
-
+    fila = []
+    pos_ord = 1
     while any(ptr[k] < len(listas[k]) for k in ptr):
-        tipo_da_vez = "AMPLA"
-        if pos_ordinal == 5 or (pos_ordinal > 21 and (pos_ordinal - 21) % 20 == 0):
-            tipo_da_vez = "COTA_PCD"
-        elif (pos_ordinal - 3) >= 0 and (pos_ordinal - 3) % 5 == 0:
-            tipo_da_vez = "COTA_NEGRO"
+        vez = "AMPLA"
+        if pos_ord == 5 or (pos_ord > 21 and (pos_ord - 21) % 20 == 0): vez = "COTA_PCD"
+        elif (pos_ord - 3) >= 0 and (pos_ord - 3) % 5 == 0: vez = "COTA_NEGRO"
 
-        if ptr[tipo_da_vez] >= len(listas[tipo_da_vez]):
-            if ptr["AMPLA"] < len(listas["AMPLA"]):
-                tipo_da_vez = "AMPLA"
-            else:
-                tipo_da_vez = next((k for k in ["COTA_NEGRO", "COTA_PCD"] if ptr[k] < len(listas[k])), None)
-
-        if not tipo_da_vez: break
-
-        cand = listas[tipo_da_vez].iloc[ptr[tipo_da_vez]].to_dict()
-        ptr[tipo_da_vez] += 1
-        cand["posicao_final"] = pos_ordinal
-        fila_final.append(cand)
-
-        if cand["sit"] == "REGULAR":
-            pos_ordinal += 1
-
-    return pd.DataFrame(fila_final)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. MOTOR DE ALOCAÇÃO
-# ─────────────────────────────────────────────────────────────────────────────
-
-def processar_alocacao(df_alunos, df_respostas, df_vagas):
-    listas = preparar_listas_por_merito(df_alunos)
-    df_classificado = gerar_fila_unica(listas)
-    
-    saldo_vagas = carregar_vagas_dict(df_vagas)
-    respostas_map = carregar_respostas_map(df_respostas)
-    
-    resultados = []
-
-    for _, cand in df_classificado.iterrows():
-        insc = str(cand["insc"])
-        resp = respostas_map.get(insc)
+        if ptr[vez] >= len(listas[vez]):
+            vez = "AMPLA" if ptr["AMPLA"] < len(listas["AMPLA"]) else next((k for k in ptr if ptr[k]<len(listas[k])), None)
         
-        res = {
-            "posicao": cand["posicao_final"],
-            "inscricao": cand["insc"],
-            "nome": cand["nome"],
-            "situacao": cand["sit"],
-            "concorrencia": cand["conc"],
-            "nota": cand["nota"],
-            "unidade": "",
-            "status": "NAO_ALOCADO",
-            "obs": ""
-        }
+        if not vez: break
+        cand = listas[vez].iloc[ptr[vez]].to_dict()
+        ptr[vez] += 1
+        cand["posicao_final"] = pos_ord
+        fila.append(cand)
+        if cand["sit"] == "REGULAR": pos_ord += 1
+    return pd.DataFrame(fila)
 
-        if not resp:
-            res["status"] = "SEM_ESCOLHA"
-            resultados.append(res)
-            continue
-
-        # Identificação dinâmica das colunas de opção (opcao_1, opcao_2...)
-        opcao_cols = sorted([c for c in resp.keys() if str(c).lower().startswith("opcao_")],
-                             key=lambda x: int(x.split('_')[1]) if '_' in x and x.split('_')[1].isdigit() else 0)
-        
-        opcoes = [str(resp.get(c, "")).strip().upper() for c in opcao_cols 
-                  if str(resp.get(c, "")).strip() and str(resp.get(c, "")).upper() not in ("NAN", "NONE", "")]
-
-        acom_conj = str(resp.get("acom_conjuge", "")).upper() in ("SIM", "S")
-        conj_reg  = str(resp.get("situacao_conjuge", "")).upper() == "REGULAR"
-        
-        alocado = False
-        for unid in opcoes:
-            vagas_disp = saldo_vagas.get(unid, 0)
-            vagas_nec = 0
-            if cand["sit"] == "REGULAR":
-                vagas_nec = 2 if (acom_conj and conj_reg) else 1
-            
-            if (unid in saldo_vagas) and (vagas_disp >= vagas_nec):
-                if cand["sit"] == "REGULAR":
-                    saldo_vagas[unid] -= vagas_nec
-                
-                res["unidade"] = unid
-                res["status"] = "ALOCADO"
-                res["obs"] = f"Consumiu {vagas_nec} vaga(s)" if cand["sit"]=="REGULAR" else "Subjudice (Espelho)"
-                alocado = True
-                break
-        
-        if not alocado:
-            res["obs"] = "Vagas esgotadas" if opcoes else "Sem opções válidas"
-            
-        resultados.append(res)
-
-    return pd.DataFrame(resultados), saldo_vagas
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. API ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
-
+# --- EXECUÇÃO ---
 @app.route("/classificar", methods=["POST"])
 def classificar():
     try:
-        df_a = pd.read_csv(io.BytesIO(request.files["alunos"].read()), encoding="utf-8-sig")
-        df_r = pd.read_csv(io.BytesIO(request.files["respostas"].read()), encoding="utf-8-sig")
-        df_v = pd.read_csv(io.BytesIO(request.files["vagas"].read()), encoding="utf-8-sig")
+        # Lendo arquivos com tratamento de erro de encoding
+        df_a = pd.read_csv(request.files["alunos"], encoding="utf-8-sig")
+        df_r = pd.read_csv(request.files["respostas"], encoding="utf-8-sig")
+        df_v = pd.read_csv(request.files["vagas"], encoding="utf-8-sig")
         
-        df_res, saldo_final = processar_alocacao(df_a, df_r, df_v)
-        df_res.to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
+        listas = preparar_listas(df_a)
+        df_fila = gerar_fila(listas)
+        vagas = carregar_vagas_dict(df_v)
+        resp_map = carregar_respostas_map(df_r)
         
-        analise = {
-            "total": len(df_res),
-            "alocados": len(df_res[df_res["status"] == "ALOCADO"]),
-            "saldo": saldo_final
-        }
-        return jsonify({"ok": True, "analise": analise, "data": df_res.head(50).to_dict(orient="records")})
-    except Exception as e:
-        return jsonify({"ok": False, "erro": str(e), "trace": traceback.format_exc()}), 500
+        resultados = []
+        for _, c in df_fila.iterrows():
+            r = resp_map.get(str(c["insc"]), {})
+            res = {"posicao": c["posicao_final"], "insc": c["insc"], "nome": c["nome"], "status": "NAO_ALOCADO", "unidade": ""}
+            
+            # Busca dinâmica de opções
+            opcoes = [str(r.get(f"opcao_{i}", "")).strip().upper() for i in range(1, 11) if r.get(f"opcao_{i}")]
+            
+            for u in opcoes:
+                if u in vagas:
+                    nec = 1 if c["sit"] == "REGULAR" else 0
+                    # Lógica de cônjuge simplificada para evitar 502 por lentidão
+                    if c["sit"] == "REGULAR" and str(r.get("acom_conjuge")).upper() in ("SIM","S") and str(r.get("situacao_conjuge")).upper() == "REGULAR":
+                        nec = 2
+                    
+                    if vagas[u] >= nec:
+                        if c["sit"] == "REGULAR": vagas[u] -= nec
+                        res.update({"unidade": u, "status": "ALOCADO"})
+                        break
+            resultados.append(res)
 
-@app.route("/resultado/csv", methods=["GET"])
-def baixar_csv():
-    return send_file(SAIDA_CSV, as_attachment=True, download_name="resultado_lotacao.csv")
+        pd.DataFrame(resultados).to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
+        return jsonify({"ok": True, "msg": "Processado"})
+    except Exception:
+        return jsonify({"ok": False, "trace": traceback.format_exc()}), 500
+
+@app.route("/resultado/csv")
+def dload(): return send_file(SAIDA_CSV, as_attachment=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
