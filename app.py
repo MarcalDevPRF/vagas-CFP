@@ -80,7 +80,8 @@ def _col(df: pd.DataFrame, *nomes) -> str:
 
 
 def carregar_alunos(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza o DataFrame de alunos/classificação."""
+    """Normaliza o DataFrame de alunos. A posicao_final será calculada
+    pela função montar_classificacao_final() após a normalização."""
     df.columns = df.columns.str.strip()
 
     # Inscrição
@@ -90,25 +91,23 @@ def carregar_alunos(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={col_insc: "inscricao_aluno"})
     df["inscricao_aluno"] = df["inscricao_aluno"].astype(str).str.strip()
 
-    # Posição / classificação
-    col_pos = _col(df, "posicao_final", "classificacao", "posicao", "posição", "ordem")
-    if col_pos:
-        df = df.rename(columns={col_pos: "posicao_final"})
-        df["posicao_final"] = pd.to_numeric(df["posicao_final"], errors="coerce")
-        df = df.sort_values("posicao_final").reset_index(drop=True)
-    else:
-        col_pont = _col(df, "pontuacao", "pontos", "pontos_aluno")
-        if col_pont:
-            df["pontuacao"] = pd.to_numeric(df[col_pont], errors="coerce").fillna(0)
-            df = df.sort_values("pontuacao", ascending=False).reset_index(drop=True)
-        df["posicao_final"] = range(1, len(df) + 1)
-
     # Pontuação
     col_pont = _col(df, "pontuacao", "pontos", "pontos_aluno")
     if col_pont and col_pont != "pontuacao":
         df["pontuacao"] = pd.to_numeric(df[col_pont], errors="coerce").fillna(0)
     elif "pontuacao" not in df.columns:
         df["pontuacao"] = 0
+    else:
+        df["pontuacao"] = pd.to_numeric(df["pontuacao"], errors="coerce").fillna(0)
+
+    # Data de nascimento → para desempate (maior idade = data menor = melhor)
+    col_nasc = _col(df, "data_nascimento", "nascimento", "dt_nascimento")
+    if col_nasc:
+        df["data_nascimento"] = pd.to_datetime(
+            df[col_nasc], dayfirst=True, errors="coerce"
+        )
+    else:
+        df["data_nascimento"] = pd.NaT
 
     # Situação
     col_sit = _col(df, "situacao_aluno", "situacao", "situação")
@@ -121,13 +120,164 @@ def carregar_alunos(df: pd.DataFrame) -> pd.DataFrame:
 
     # Concorrência
     col_conc = _col(df, "concorrencia_aluno", "concorrencia", "concorrência")
-    df["concorrencia_aluno"] = df[col_conc].astype(str).str.strip() if col_conc else ""
+    df["concorrencia_aluno"] = (df[col_conc].astype(str).str.strip().str.upper()
+                                if col_conc else "AMPLA")
 
     # Motivo chamada (opcional)
     col_mot = _col(df, "motivo_chamada")
     df["motivo_chamada"] = df[col_mot].astype(str).str.strip() if col_mot else ""
 
     return df
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MONTAGEM DA CLASSIFICAÇÃO FINAL  (alternância + proporcionalidade)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def montar_classificacao_final(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recebe o DataFrame de alunos já normalizado e devolve a lista final
+    ordenada com posicao_final atribuída, seguindo:
+
+    1. Separação em 3 listas de REGULARES ordenadas por nota DESC,
+       desempate por data_nascimento ASC (mais velho = mais novo na data = melhor):
+         - lista_ampla    → concorrencia_aluno == "AMPLA"
+         - lista_negro    → concorrencia_aluno == "COTA_NEGRO"
+         - lista_pcd      → concorrencia_aluno == "COTA_PCD"
+
+    2. Montagem da fila por alternância (relógio):
+         - Posições 3, 8, 13, 18, 23... → COTA_NEGRO
+         - Posições 5, 21, 41, 61, 81... → COTA_PCD  (a partir de 5, de 20 em 20)
+         - Demais → AMPLA
+       Se a cota chamada estiver esgotada, usa AMPLA no lugar.
+
+    3. Inserção dos SUBJUDICE (vaga espelho):
+       - Cada SUBJUDICE é inserido na posição equivalente à sua nota na lista
+         REGULAR correspondente, sem deslocar as posições ordinais dos REGULARES.
+       - SUBJUDICE com mesma nota de um REGULAR → mesma posicao_final (espelho).
+       - SUBJUDICE sem empate → posicao_final igual ao REGULAR imediatamente
+         abaixo (nota superior mais próxima).
+       - SUBJUDICE nunca desloca REGULAR.
+    """
+    import math
+
+    # ── Separar REGULARES e SUBJUDICE ────────────────────────────────────────
+    regulares  = df[df["situacao_aluno"] == "REGULAR"].copy()
+    subjudices = df[df["situacao_aluno"] == "SUBJUDICE"].copy()
+
+    # ── Ordenar cada lista de REGULARES: nota DESC, nascimento ASC (mais velho primeiro)
+    def ordenar_lista(sub_df):
+        sub_df = sub_df.copy()
+        # Para desempate: data_nascimento ASC (mais velho = data menor = prioridade)
+        # Candidatos sem data ficam por último no desempate
+        sub_df["_nasc_sort"] = sub_df["data_nascimento"].apply(
+            lambda d: d if pd.notna(d) else pd.Timestamp("2099-01-01")
+        )
+        return sub_df.sort_values(
+            ["pontuacao", "_nasc_sort"], ascending=[False, True]
+        ).reset_index(drop=True)
+
+    lista_ampla = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "AMPLA"])
+    lista_negro = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_NEGRO"])
+    lista_pcd   = ordenar_lista(regulares[regulares["concorrencia_aluno"] == "COTA_PCD"])
+
+    # Ponteiros para cada lista
+    ptr = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
+    listas = {"AMPLA": lista_ampla, "COTA_NEGRO": lista_negro, "COTA_PCD": lista_pcd}
+
+    total_regulares = len(regulares)
+
+    # ── Determinar tipo de cada posição (relógio) ─────────────────────────────
+    def tipo_posicao(pos):
+        """pos é 1-based. Retorna 'COTA_NEGRO', 'COTA_PCD' ou 'AMPLA'."""
+        # PcD: posições 5, 21, 41, 61, 81... (5 fixo, depois de 20 em 20 a partir de 21)
+        if pos == 5 or (pos >= 21 and (pos - 21) % 20 == 0):
+            return "COTA_PCD"
+        # Negro: posições 3, 8, 13, 18, 23... (de 5 em 5, começando em 3)
+        if (pos - 3) >= 0 and (pos - 3) % 5 == 0:
+            return "COTA_NEGRO"
+        return "AMPLA"
+
+    # ── Montar fila de REGULARES ──────────────────────────────────────────────
+    fila_regular = []   # lista de dicts com posicao_final + dados do candidato
+    pos_ordinal  = 0    # contador de posição ordinal (só sobe com REGULAR)
+
+    while sum(ptr[k] < len(listas[k]) for k in ptr) > 0:
+        pos_ordinal += 1
+        tipo = tipo_posicao(pos_ordinal)
+
+        # Se a cota chamada está esgotada, usa AMPLA
+        if ptr[tipo] >= len(listas[tipo]):
+            tipo = "AMPLA"
+
+        # Se AMPLA também esgotou, encerra
+        if ptr[tipo] >= len(listas[tipo]):
+            break
+
+        cand = listas[tipo].iloc[ptr[tipo]].to_dict()
+        ptr[tipo] += 1
+        cand["posicao_final"]   = pos_ordinal
+        cand["tipo_vaga"]       = tipo
+        fila_regular.append(cand)
+
+    df_regular = pd.DataFrame(fila_regular) if fila_regular else pd.DataFrame()
+
+    # ── Inserir SUBJUDICE (vaga espelho) ──────────────────────────────────────
+    # Para cada SUBJUDICE, encontrar a posicao_final do REGULAR com nota
+    # imediatamente igual ou superior.
+    resultado_final = []
+
+    if df_regular.empty:
+        # Sem regulares, todos subjudice ficam com posição sequencial
+        for i, (_, s) in enumerate(subjudices.iterrows(), 1):
+            row = s.to_dict()
+            row["posicao_final"] = i
+            row["tipo_vaga"]     = row.get("concorrencia_aluno", "AMPLA")
+            resultado_final.append(row)
+    else:
+        # Adicionar todos os regulares
+        for row in fila_regular:
+            resultado_final.append(dict(row))
+
+        # Para cada subjudice, determinar sua posição espelho
+        for _, subj in subjudices.iterrows():
+            row = subj.to_dict()
+            nota_subj = row.get("pontuacao", 0)
+
+            # Encontrar o REGULAR com nota superior mais próxima (ou igual)
+            # → posição espelho = posicao_final desse REGULAR
+            regulares_acima = [
+                r for r in fila_regular
+                if r.get("pontuacao", 0) >= nota_subj
+            ]
+            if regulares_acima:
+                # Pegar o de menor nota entre os que estão acima (mais próximo)
+                espelho = min(regulares_acima, key=lambda r: r["pontuacao"])
+                row["posicao_final"] = espelho["posicao_final"]
+            else:
+                # Nota maior que todos os regulares → posição 1 (antes de todos)
+                row["posicao_final"] = 1
+
+            row["tipo_vaga"] = row.get("concorrencia_aluno", "AMPLA")
+            resultado_final.append(row)
+
+    df_final = pd.DataFrame(resultado_final)
+
+    # ── Ordenar: posicao_final ASC, REGULAR antes de SUBJUDICE, nota DESC ────
+    df_final["_ordem_sit"] = df_final["situacao_aluno"].apply(
+        lambda s: 0 if s == "REGULAR" else 1
+    )
+    df_final = df_final.sort_values(
+        ["posicao_final", "_ordem_sit", "pontuacao"],
+        ascending=[True, True, False]
+    ).reset_index(drop=True)
+
+    # Limpar colunas auxiliares
+    df_final = df_final.drop(
+        columns=[c for c in ["_nasc_sort", "_ordem_sit"] if c in df_final.columns]
+    )
+
+    return df_final
 
 
 def carregar_vagas(df: pd.DataFrame) -> tuple:
@@ -273,9 +423,12 @@ def _norm_insc(val):
 
 
 def processar_alocacao(df_alunos_raw, df_respostas_raw, df_vagas_raw):
-    classif               = carregar_alunos(df_alunos_raw)
+    # 1. Normalizar alunos
+    df_alunos_norm          = carregar_alunos(df_alunos_raw)
+    # 2. Montar lista final de classificação (alternância + SUBJUDICE espelho)
+    classif                 = montar_classificacao_final(df_alunos_norm)
     saldo_vagas, vagas_orig = carregar_vagas(df_vagas_raw)
-    respostas, opcao_cols = carregar_respostas(df_respostas_raw)
+    respostas, opcao_cols   = carregar_respostas(df_respostas_raw)
 
     # Normaliza inscrição dos dois lados para garantir o match
     classif["inscricao_aluno"] = classif["inscricao_aluno"].apply(_norm_insc)
@@ -573,14 +726,16 @@ def analise():
 
 @app.post("/debug")
 def debug():
-    """Devolve colunas e primeiras 3 linhas de cada CSV recebido."""
+    """Devolve colunas, primeiras 3 linhas e diagnóstico de match de inscrições."""
     resultado = {}
+    dfs = {}
     for campo in ("alunos", "respostas", "vagas"):
         if campo not in request.files:
             resultado[campo] = {"erro": "arquivo ausente"}
             continue
         try:
             df = _csv_to_df(request.files[campo])
+            dfs[campo] = df
             resultado[campo] = {
                 "colunas": list(df.columns),
                 "linhas":  df.head(3).to_dict(orient="records"),
@@ -588,6 +743,37 @@ def debug():
             }
         except Exception as e:
             resultado[campo] = {"erro": str(e)}
+
+    # Diagnóstico de match entre alunos e respostas
+    if "alunos" in dfs and "respostas" in dfs:
+        df_a = dfs["alunos"]
+        df_r = dfs["respostas"]
+
+        # Encontrar coluna de inscrição nos alunos
+        col_a = _col(df_a, "inscricao_aluno", "inscricao", "inscrição_aluno")
+        # Encontrar coluna de inscrição nas respostas
+        col_r = _col(df_r, "inscricao-aluno", "inscricao_aluno", "inscrição_aluno", "inscricao", "inscrição")
+
+        inscs_alunos   = [str(v).strip() for v in df_a[col_a].tolist()[:10]] if col_a else []
+        inscs_respostas = [str(v).strip() for v in df_r[col_r].tolist()[:10]] if col_r else []
+
+        # Contar matches reais
+        set_alunos    = set(str(v).strip() for v in df_a[col_a]) if col_a else set()
+        set_respostas = set(str(v).strip() for v in df_r[col_r]) if col_r else set()
+        matches = len(set_alunos & set_respostas)
+
+        resultado["diagnostico_match"] = {
+            "col_inscricao_alunos":    col_a,
+            "col_inscricao_respostas": col_r,
+            "primeiras_10_inscricoes_alunos":    inscs_alunos,
+            "primeiras_10_inscricoes_respostas": inscs_respostas,
+            "total_alunos":    len(set_alunos),
+            "total_respostas": len(set_respostas),
+            "matches_encontrados": matches,
+            "sem_match_alunos": list(set_alunos - set_respostas)[:5],
+            "sem_match_respostas": list(set_respostas - set_alunos)[:5],
+        }
+
     return jsonify(resultado)
 
 
