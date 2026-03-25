@@ -31,12 +31,37 @@ SAIDA = WDIR / "resultado_lotacao.csv"
 
 # ── Helpers de coluna ─────────────────────────────────────────────────────────
 
+def _normalizar_col(s):
+    """Remove acentos, BOM e converte para lowercase — para comparar nomes de colunas."""
+    import unicodedata
+    s = str(s).strip().replace("\ufeff", "")
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 def _col(df, *candidatos):
-    """Retorna o nome real da primeira coluna que casar (case-insensitive)."""
-    mapa = {c.lower().strip(): c for c in df.columns}
+    """
+    Retorna o nome real da primeira coluna que casar,
+    insensivel a maiusculas, acentos e BOM.
+    Ex: "Inscricao" (com acento) casa com "inscricao_aluno" por match parcial.
+    """
+    mapa = {_normalizar_col(c): c for c in df.columns}
+
+    # 1a passagem: match exato normalizado
     for n in candidatos:
-        if n.lower() in mapa:
-            return mapa[n.lower()]
+        norm = _normalizar_col(n)
+        if norm in mapa:
+            return mapa[norm]
+
+    # 2a passagem: match parcial (ex: "inscricao" dentro de "inscricao_aluno")
+    for n in candidatos:
+        norm = _normalizar_col(n)
+        for k, v in mapa.items():
+            if norm in k or k in norm:
+                return v
+
     return None
 
 
