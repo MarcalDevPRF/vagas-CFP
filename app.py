@@ -19,31 +19,30 @@ def _col(df, *nomes):
 def carregar_vagas_dict(df):
     unid_col = _col(df, "unidade", "nome_unidade")
     vaga_col = _col(df, "vagas", "quantidade")
-    return dict(zip(df[unid_col].astype(str).str.upper().str.strip(), 
+    return dict(zip(df[unid_col].astype(str).str.upper().str.strip(),
                     pd.to_numeric(df[vaga_col], errors="coerce").fillna(0).astype(int)))
 
 def carregar_respostas_map(df):
-    c_insc = _col(df, "inscricao_aluno", "inscricao", "matricula")
+    c_insc = _col(df, "inscricao_aluno", "inscricao")
     df["insc_norm"] = df[c_insc].astype(str).str.replace(".0", "", regex=False).str.strip()
     return df.drop_duplicates(subset=["insc_norm"], keep="last").set_index("insc_norm").to_dict(orient="index")
 
 def preparar_listas(df):
-    # Padronização de colunas
     c_insc = _col(df, "inscricao_aluno", "inscricao")
     c_nota = _col(df, "pontuacao", "nota")
     c_nasc = _col(df, "data_nascimento")
-    c_conc = _col(df, "concorrencia_aluno")
-    c_sit  = _col(df, "situacao_aluno")
+    c_conc = _col(df, "concorrencia_aluno", "concorrencia")
+    c_sit  = _col(df, "situacao_aluno", "situacao")
 
     df_p = pd.DataFrame()
     df_p["insc"] = df[c_insc].astype(str).str.replace(".0", "", regex=False).str.strip()
     df_p["nome"] = df[_col(df, "nome_aluno", "nome")].astype(str)
     df_p["nota"] = pd.to_numeric(df[c_nota], errors="coerce").fillna(0)
-    df_p["nasc"] = pd.to_datetime(df[c_nasc], errors="coerce")
+    df_p["nasc"] = pd.to_datetime(df[c_nasc], errors="coerce") if c_nasc else pd.NaT
     df_p["conc"] = df[c_conc].astype(str).str.upper().fillna("AMPLA")
     df_p["sit"]  = df[c_sit].astype(str).str.upper().fillna("REGULAR")
     df_p["nasc_sort"] = df_p["nasc"].fillna(pd.Timestamp("2099-12-31"))
-    
+
     def ordenar(sub): return sub.sort_values(["nota", "nasc_sort"], ascending=[False, True]).reset_index(drop=True)
 
     return {
@@ -56,7 +55,7 @@ def gerar_fila_com_prioridade_subjudice(listas):
     ptr = {"AMPLA": 0, "COTA": 0, "PCD": 0}
     fila_final = []
     pos_vaga_regular = 1
-    
+
     while any(ptr[k] < len(listas[k]) for k in ptr):
         tipo_vez = "AMPLA"
         if pos_vaga_regular == 5 or (pos_vaga_regular > 21 and (pos_vaga_regular - 21) % 20 == 0):
@@ -66,86 +65,88 @@ def gerar_fila_com_prioridade_subjudice(listas):
 
         if ptr[tipo_vez] >= len(listas[tipo_vez]):
             tipo_vez = "AMPLA" if ptr["AMPLA"] < len(listas["AMPLA"]) else next((k for k in ptr if ptr[k] < len(listas[k])), None)
-        
+
         if not tipo_vez: break
-        
-        # --- LÓGICA DE PRIORIDADE SUBJUDICE NA MESMA POSIÇÃO ---
+
         # Pegamos todos os candidatos que "empatariam" na mesma vaga (Subjudices + 1 Regular)
         candidatos_da_posicao = []
-        
+
         while ptr[tipo_vez] < len(listas[tipo_vez]):
             cand_atual = listas[tipo_vez].iloc[ptr[tipo_vez]].to_dict()
             candidatos_da_posicao.append(cand_atual)
             ptr[tipo_vez] += 1
-            # Se pegamos um REGULAR, paramos o grupo desta posição
             if cand_atual["sit"] == "REGULAR":
                 break
-        
-        # Ordenamos o grupo: SUBJUDICE primeiro, REGULAR por último
-        # No Python, True (Subjudice) vem depois de False, então invertemos ou usamos key
+
+        # SUBJUDICE primeiro, REGULAR por último
         candidatos_da_posicao.sort(key=lambda x: 0 if x["sit"] == "SUBJUDICE" else 1)
-        
+
         for c in candidatos_da_posicao:
             c["posicao_final"] = pos_vaga_regular
             fila_final.append(c)
-        
+
         pos_vaga_regular += 1
-            
-    return pd.DataFrame(fila_final)
+
+    df = pd.DataFrame(fila_final)
+    if df.empty:
+        return df
+
+    # Garante: dentro de cada posicao_final, SUBJUDICE sempre antes de REGULAR.
+    # Subjudices não consomem vaga (vaga espelho); o regular só entra depois de
+    # todos os subjudices daquela posição já terem sido alocados.
+    df["_ord_sit"] = df["sit"].apply(lambda x: 0 if x == "SUBJUDICE" else 1)
+    df = df.sort_values(["posicao_final", "_ord_sit"], ascending=[True, True], kind="stable")
+    df = df.drop(columns=["_ord_sit"]).reset_index(drop=True)
+    return df
 
 @app.route("/classificar", methods=["POST"])
 def classificar():
     try:
-        df_a = pd.read_csv(request.files["alunos"], encoding="utf-8-sig")
+        df_a = pd.read_csv(request.files["alunos"],   encoding="utf-8-sig")
         df_r = pd.read_csv(request.files["respostas"], encoding="utf-8-sig")
-        df_v = pd.read_csv(request.files["vagas"], encoding="utf-8-sig")
-        
-        listas = preparar_listas(df_a)
-        df_fila = gerar_fila_com_prioridade_subjudice(listas)
-        vagas = carregar_vagas_dict(df_v)
+        df_v = pd.read_csv(request.files["vagas"],    encoding="utf-8-sig")
+
+        listas   = preparar_listas(df_a)
+        df_fila  = gerar_fila_com_prioridade_subjudice(listas)
+        vagas    = carregar_vagas_dict(df_v)
         resp_map = carregar_respostas_map(df_r)
-        
-        resultados = []
-        opcao_cols = [f"opcao_{i}" for i in range(1, 29)]
+
+        resultados  = []
+        opcao_cols  = [f"opcao_{i}" for i in range(1, 29)]
         class_count = {"AMPLA": 0, "COTA": 0, "PCD": 0}
 
         for _, c in df_fila.iterrows():
-            r = resp_map.get(str(c["insc"]), {})
+            r    = resp_map.get(str(c["insc"]), {})
             conc = str(c["conc"])
             class_count[conc] = class_count.get(conc, 0) + 1
             tipo_vaga = "COTA_NEGRO" if conc == "COTA" else conc
             opcoes = [str(r.get(opt, "")).strip().upper() for opt in opcao_cols if r.get(opt)]
 
             res = {
-                # Campos JSON para o frontend
-                "posicao_geral":  int(c["posicao_final"]),
-                "tipo_vaga":      tipo_vaga,
-                "classificacao":  class_count[conc],
-                "inscricao":      c["insc"],
-                "nome":           c["nome"],
-                "concorrencia":   conc,
-                "situacao":       c["sit"],
-                "pontuacao":      float(c["nota"]) if pd.notna(c["nota"]) else 0.0,
-                "opcoes":         opcoes,
+                "posicao_geral":   int(c["posicao_final"]),
+                "tipo_vaga":       tipo_vaga,
+                "classificacao":   class_count[conc],
+                "inscricao":       c["insc"],
+                "nome":            c["nome"],
+                "concorrencia":    conc,
+                "situacao":        c["sit"],
+                "pontuacao":       float(c["nota"]) if pd.notna(c["nota"]) else 0.0,
+                "opcoes":          opcoes,
                 "unidade_alocada": "NÃO ALOCADO",
-                "obs":            "",
+                "obs":             "",
             }
 
             alocado = False
             for u in opcoes:
                 if u in vagas:
-                    is_sub = (c["sit"] == "SUBJUDICE")
-                    quer_conj = str(r.get("acom_conjuge", "")).upper() in ("SIM","S")
-                    conj_reg = str(r.get("situacao_conjuge", "")).upper() == "REGULAR"
+                    is_sub     = (c["sit"] == "SUBJUDICE")
+                    quer_conj  = str(r.get("acom_conjuge", "")).upper() in ("SIM", "S")
+                    conj_reg   = str(r.get("situacao_conjuge", "")).upper() == "REGULAR"
+                    custo      = 2 if (quer_conj and conj_reg and not is_sub) else (1 if not is_sub else 0)
 
-                    custo = 2 if (quer_conj and conj_reg and not is_sub) else (1 if not is_sub else 0)
-
-                    # Se for Subjudice, ele SEMPRE consegue espelhar se a unidade existe no mapa de vagas
-                    # Se for Regular, precisa ter saldo >= custo
                     if is_sub or vagas[u] >= custo:
                         if not is_sub:
                             vagas[u] -= custo
-
                         res["unidade_alocada"] = u
                         res["obs"] = "Alocado (Vaga Espelho)" if is_sub else f"Alocado (Custo: {custo})"
                         alocado = True
@@ -155,15 +156,15 @@ def classificar():
                 res["obs"] = "Vagas esgotadas" if opcoes else "Sem escolhas registradas"
             resultados.append(res)
 
-        # Salva CSV com nomes de colunas em português (compatibilidade legada)
+        # CSV legado com nomes em português
         csv_rows = [{
-            "Classificação":  r["posicao_geral"],
-            "Inscrição":      r["inscricao"],
-            "Nome":           r["nome"],
-            "Cota":           r["concorrencia"],
-            "Situação":       r["situacao"],
+            "Classificação":   r["posicao_geral"],
+            "Inscrição":       r["inscricao"],
+            "Nome":            r["nome"],
+            "Cota":            r["concorrencia"],
+            "Situação":        r["situacao"],
             "Unidade Alocada": r["unidade_alocada"],
-            "Obs":            r["obs"],
+            "Obs":             r["obs"],
         } for r in resultados]
         pd.DataFrame(csv_rows).to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
 
