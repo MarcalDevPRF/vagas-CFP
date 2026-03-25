@@ -172,7 +172,8 @@ def classificar():
         pd.DataFrame(csv_rows).to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
 
         return jsonify({"ok": True, "total": len(resultados), "resultado": resultados, "avisos": []})
-    _exc()}), 500
+    except Exception:
+        return jsonify({"ok": False, "trace": traceback.format_exc()}), 500
 
 @app.route("/resultado/csv")
 def dload(): return send_file(SAIDA_CSV, as_attachment=True)
