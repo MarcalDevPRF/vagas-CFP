@@ -47,21 +47,21 @@ def preparar_listas(df):
 
     return {
         "AMPLA": ordenar(df_p[df_p["conc"] == "AMPLA"]),
-        "COTA":  ordenar(df_p[df_p["conc"] == "COTA"]),
-        "PCD":   ordenar(df_p[df_p["conc"] == "PCD"])
+        "COTA_NEGRO":  ordenar(df_p[df_p["conc"] == "COTA_NEGRO"]),
+        "COTA_PCD":   ordenar(df_p[df_p["conc"] == "COTA_PCD"])
     }
 
 def gerar_fila_com_prioridade_subjudice(listas):
-    ptr = {"AMPLA": 0, "COTA": 0, "PCD": 0}
+    ptr = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
     fila_final = []
     pos_vaga_regular = 1
 
     while any(ptr[k] < len(listas[k]) for k in ptr):
         tipo_vez = "AMPLA"
         if pos_vaga_regular == 5 or (pos_vaga_regular > 21 and (pos_vaga_regular - 21) % 20 == 0):
-            tipo_vez = "PCD"
+            tipo_vez = "COTA_PCD"
         elif (pos_vaga_regular >= 3) and ((pos_vaga_regular - 3) % 5 == 0):
-            tipo_vez = "COTA"
+            tipo_vez = "COTA_NEGRO"
 
         if ptr[tipo_vez] >= len(listas[tipo_vez]):
             tipo_vez = "AMPLA" if ptr["AMPLA"] < len(listas["AMPLA"]) else next((k for k in ptr if ptr[k] < len(listas[k])), None)
@@ -113,13 +113,13 @@ def classificar():
 
         resultados  = []
         opcao_cols  = [f"opcao_{i}" for i in range(1, 29)]
-        class_count = {"AMPLA": 0, "COTA": 0, "PCD": 0}
+        class_count = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
 
         for _, c in df_fila.iterrows():
             r    = resp_map.get(str(c["insc"]), {})
             conc = str(c["conc"])
             class_count[conc] = class_count.get(conc, 0) + 1
-            tipo_vaga = "COTA_NEGRO" if conc == "COTA" else conc
+            tipo_vaga = "COTA_NEGRO" if conc == "COTA_NEGRO" else conc
             opcoes = [str(r.get(opt, "")).strip().upper() for opt in opcao_cols if r.get(opt)]
 
             res = {
