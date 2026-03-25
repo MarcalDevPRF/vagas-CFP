@@ -23,7 +23,7 @@ def carregar_vagas_dict(df):
                     pd.to_numeric(df[vaga_col], errors="coerce").fillna(0).astype(int)))
 
 def carregar_respostas_map(df):
-    c_insc = _col(df, "inscricao_aluno", "inscricao")
+    c_insc = _col(df, "inscricao_aluno", "inscricao", "matricula")
     df["insc_norm"] = df[c_insc].astype(str).str.replace(".0", "", regex=False).str.strip()
     return df.drop_duplicates(subset=["insc_norm"], keep="last").set_index("insc_norm").to_dict(orient="index")
 
