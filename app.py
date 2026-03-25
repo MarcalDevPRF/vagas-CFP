@@ -229,32 +229,43 @@ def _montar_fila_concorrencia(df_alunos, concorrencia):
     return fila
 
 
+def _normalizar_concorrencia(df, col_conc):
+    """
+    Normaliza valores de concorrência para os nomes canônicos,
+    aceitando nomes antigos ('COTA','PCD') e novos ('COTA_NEGRO','COTA_PCD').
+    """
+    MAPA = {
+        "AMPLA":      "AMPLA",
+        "COTA":       "COTA_NEGRO",
+        "COTA_NEGRO": "COTA_NEGRO",
+        "PCD":        "COTA_PCD",
+        "COTA_PCD":   "COTA_PCD",
+    }
+    df = df.copy()
+    df[col_conc] = (df[col_conc].astype(str).str.upper().str.strip()
+                    .map(MAPA).fillna("AMPLA"))
+    return df
+
+
 def montar_fila_global(df_alunos):
     """
-    Aplica o relógio de cotas sobre as filas internas de cada concorrência.
+    Aplica o relogio de cotas sobre as filas internas de cada concorrencia.
 
-    RELÓGIO:
-      - COTA (20%): posições 3, 8, 13, 18 … → (pos − 3) % 5 == 0
-      - PCD   (5%): posições 5, 25, 45, 65 … → (pos − 5) % 20 == 0
+    RELOGIO:
+      - COTA_NEGRO (20%): posicoes 3, 8, 13, 18 ... (pos-3) % 5 == 0
+      - COTA_PCD   (5%): posicoes 5, 25, 45, 65 ... (pos-5) % 20 == 0
       - Demais: AMPLA
 
-    REGRA DE FALLBACK: se a fila de cota estiver vazia, a posição
-    reservada é preenchida por AMPLA; o relógio avança normalmente.
-
-    Os valores 'COTA' e 'PCD' vêm da planilha — mapeamos para
-    os nomes legíveis que o frontend exibe.
+    Aceita valores antigos ('COTA','PCD'), novos ('COTA_NEGRO','COTA_PCD')
+    e typos como 'COTA_PDC' — todos normalizados antes do processamento.
     """
-    # Mapear nomes da planilha → nome interno
-    # A planilha usa: AMPLA, COTA, PCD
-    # A planilha grava "COTA" e "PCD" — mapeamos aqui para os nomes
-    # canônicos COTA_NEGRO e COTA_PCD usados em todo o restante do código.
-    fila_ampla      = _montar_fila_concorrencia(df_alunos, "AMPLA")
-    fila_cota_negro = _montar_fila_concorrencia(df_alunos, "COTA")   # planilha → COTA
-    fila_cota_pcd   = _montar_fila_concorrencia(df_alunos, "PCD")    # planilha → PCD
+    # Normalizar concorrencia: trata COTA/COTA_NEGRO e PCD/COTA_PCD/COTA_PDC
+    c_conc    = _col(df_alunos, "concorrencia_aluno", "concorrencia")
+    df_alunos = _normalizar_concorrencia(df_alunos, c_conc)
 
-    # Renomear conc para o nome canônico antes de entrar no relógio
-    for c in fila_cota_negro: c["conc"] = "COTA_NEGRO"
-    for c in fila_cota_pcd:   c["conc"] = "COTA_PCD"
+    fila_ampla      = _montar_fila_concorrencia(df_alunos, "AMPLA")
+    fila_cota_negro = _montar_fila_concorrencia(df_alunos, "COTA_NEGRO")
+    fila_cota_pcd   = _montar_fila_concorrencia(df_alunos, "COTA_PCD")
 
     ptrs  = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
     filas = {"AMPLA": fila_ampla, "COTA_NEGRO": fila_cota_negro, "COTA_PCD": fila_cota_pcd}
@@ -263,8 +274,7 @@ def montar_fila_global(df_alunos):
     resultado = []
 
     for pos in range(1, total + 1):
-        # Determinar tipo da vaga pelo relógio
-        # REGRA: PCD tem precedência sobre COTA se ambos coincidirem
+        # Relogio: COTA_PCD tem precedencia se coincidir com COTA_NEGRO
         if pos >= 5 and (pos - 5) % 20 == 0:
             tipo_vez = "COTA_PCD"
         elif pos >= 3 and (pos - 3) % 5 == 0:
@@ -274,13 +284,12 @@ def montar_fila_global(df_alunos):
 
         # Fallback se fila do tipo estiver esgotada
         if ptrs[tipo_vez] >= len(filas[tipo_vez]):
-            # Tenta AMPLA → COTA_NEGRO → COTA_PCD na ordem
             for fallback in ["AMPLA", "COTA_NEGRO", "COTA_PCD"]:
                 if ptrs[fallback] < len(filas[fallback]):
                     tipo_vez = fallback
                     break
             else:
-                break  # todas as filas esgotadas
+                break
 
         cand = filas[tipo_vez][ptrs[tipo_vez]].copy()
         cand["posicao_final"] = pos
@@ -289,6 +298,7 @@ def montar_fila_global(df_alunos):
         ptrs[tipo_vez] += 1
 
     return resultado
+
 
 
 # ── 4. Alocar candidatos ──────────────────────────────────────────────────────
@@ -414,12 +424,28 @@ def classificar():
                     "erro": f"Campo obrigatório ausente no multipart: '{campo}'"
                 }), 400
 
-        # Ler CSVs — utf-8-sig para remover BOM gerado pelo Sheets
-        df_a = pd.read_csv(request.files["alunos"],   encoding="utf-8-sig")
-        df_r = pd.read_csv(request.files["respostas"], encoding="utf-8-sig")
-        df_v = pd.read_csv(request.files["vagas"],    encoding="utf-8-sig")
+        # Ler CSVs — tentar utf-8-sig primeiro, fallback para latin-1
+        def ler_csv_robusto(fileobj, nome):
+            raw = fileobj.read()
+            for enc in ("utf-8-sig", "utf-8", "latin-1"):
+                try:
+                    import io as _io
+                    df = pd.read_csv(_io.BytesIO(raw), encoding=enc)
+                    app.logger.info(f"CSV {nome} lido com {enc}: {len(df)} linhas, colunas={list(df.columns)}")
+                    return df
+                except Exception as e:
+                    app.logger.warning(f"CSV {nome} falhou com {enc}: {e}")
+            raise ValueError(f"Nao foi possivel ler o CSV '{nome}' com nenhum encoding")
+
+        df_a = ler_csv_robusto(request.files["alunos"],   "alunos")
+        df_r = ler_csv_robusto(request.files["respostas"], "respostas")
+        df_v = ler_csv_robusto(request.files["vagas"],    "vagas")
 
         certame = request.form.get("certame", "")
+        app.logger.info(f"certame={certame}")
+        app.logger.info(f"colunas alunos:    {list(df_a.columns)}")
+        app.logger.info(f"colunas respostas: {list(df_r.columns)}")
+        app.logger.info(f"colunas vagas:     {list(df_v.columns)}")
 
         # Processar
         saldo_vagas          = carregar_vagas(df_v)
