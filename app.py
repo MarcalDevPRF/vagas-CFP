@@ -43,25 +43,15 @@ def _normalizar_col(s):
 
 def _col(df, *candidatos):
     """
-    Retorna o nome real da primeira coluna que casar,
-    insensivel a maiusculas, acentos e BOM.
-    Ex: "Inscricao" (com acento) casa com "inscricao_aluno" por match parcial.
+    Retorna o nome real da primeira coluna que casar — somente match EXATO
+    após normalizar acentos, maiúsculas e BOM. Sem match parcial para
+    evitar que 'inscricao' case com 'inscricao_aluno' erroneamente.
     """
     mapa = {_normalizar_col(c): c for c in df.columns}
-
-    # 1a passagem: match exato normalizado
     for n in candidatos:
         norm = _normalizar_col(n)
         if norm in mapa:
             return mapa[norm]
-
-    # 2a passagem: match parcial (ex: "inscricao" dentro de "inscricao_aluno")
-    for n in candidatos:
-        norm = _normalizar_col(n)
-        for k, v in mapa.items():
-            if norm in k or k in norm:
-                return v
-
     return None
 
 
@@ -100,7 +90,7 @@ def carregar_respostas(df_r):
     Detecta dinamicamente quantas colunas opcao_N existem.
     Mantém apenas a linha mais recente por inscrição (keep='last').
     """
-    c_insc = _col(df_r, "inscricao_aluno", "inscricao")
+    c_insc = _col(df_r, "inscricao_aluno")
     if not c_insc:
         raise ValueError("CSV de respostas precisa da coluna 'inscricao_aluno'.")
 
@@ -152,7 +142,7 @@ def _montar_fila_concorrencia(df_alunos, concorrencia):
 
     REGRA R6: SUBJUDICE é processado ANTES do REGULAR empatado.
     """
-    c_insc = _col(df_alunos, "inscricao_aluno", "inscricao")
+    c_insc = _col(df_alunos, "inscricao_aluno")
     c_nome = _col(df_alunos, "nome_aluno", "nome")
     c_nota = _col(df_alunos, "pontuacao", "nota")
     c_nasc = _col(df_alunos, "data_nascimento")
