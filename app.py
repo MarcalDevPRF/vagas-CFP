@@ -221,13 +221,19 @@ def montar_fila_global(df_alunos):
     """
     # Mapear nomes da planilha → nome interno
     # A planilha usa: AMPLA, COTA, PCD
-    fila_ampla = _montar_fila_concorrencia(df_alunos, "AMPLA")
-    fila_cota  = _montar_fila_concorrencia(df_alunos, "COTA")
-    fila_pcd   = _montar_fila_concorrencia(df_alunos, "PCD")
+    # A planilha grava "COTA" e "PCD" — mapeamos aqui para os nomes
+    # canônicos COTA_NEGRO e COTA_PCD usados em todo o restante do código.
+    fila_ampla      = _montar_fila_concorrencia(df_alunos, "AMPLA")
+    fila_cota_negro = _montar_fila_concorrencia(df_alunos, "COTA")   # planilha → COTA
+    fila_cota_pcd   = _montar_fila_concorrencia(df_alunos, "PCD")    # planilha → PCD
 
-    ptrs  = {"AMPLA": 0, "COTA": 0, "PCD": 0}
-    filas = {"AMPLA": fila_ampla, "COTA": fila_cota, "PCD": fila_pcd}
-    total = len(fila_ampla) + len(fila_cota) + len(fila_pcd)
+    # Renomear conc para o nome canônico antes de entrar no relógio
+    for c in fila_cota_negro: c["conc"] = "COTA_NEGRO"
+    for c in fila_cota_pcd:   c["conc"] = "COTA_PCD"
+
+    ptrs  = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
+    filas = {"AMPLA": fila_ampla, "COTA_NEGRO": fila_cota_negro, "COTA_PCD": fila_cota_pcd}
+    total = len(fila_ampla) + len(fila_cota_negro) + len(fila_cota_pcd)
 
     resultado = []
 
@@ -235,16 +241,16 @@ def montar_fila_global(df_alunos):
         # Determinar tipo da vaga pelo relógio
         # REGRA: PCD tem precedência sobre COTA se ambos coincidirem
         if pos >= 5 and (pos - 5) % 20 == 0:
-            tipo_vez = "PCD"
+            tipo_vez = "COTA_PCD"
         elif pos >= 3 and (pos - 3) % 5 == 0:
-            tipo_vez = "COTA"
+            tipo_vez = "COTA_NEGRO"
         else:
             tipo_vez = "AMPLA"
 
         # Fallback se fila do tipo estiver esgotada
         if ptrs[tipo_vez] >= len(filas[tipo_vez]):
-            # Tenta AMPLA → COTA → PCD na ordem
-            for fallback in ["AMPLA", "COTA", "PCD"]:
+            # Tenta AMPLA → COTA_NEGRO → COTA_PCD na ordem
+            for fallback in ["AMPLA", "COTA_NEGRO", "COTA_PCD"]:
                 if ptrs[fallback] < len(filas[fallback]):
                     tipo_vez = fallback
                     break
@@ -277,7 +283,7 @@ def alocar(fila, resp_map, opcao_cols, saldo_vagas):
       R8  Sem opção viável → NAO_ALOCADO.
     """
     resultados   = []
-    class_count  = {"AMPLA": 0, "COTA": 0, "PCD": 0}
+    class_count  = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
     avisos       = []
 
     for cand in fila:
