@@ -1,4 +1,3 @@
-import io
 import os
 import traceback
 import pandas as pd
@@ -46,8 +45,8 @@ def preparar_listas(df):
     def ordenar(sub): return sub.sort_values(["nota", "nasc_sort"], ascending=[False, True]).reset_index(drop=True)
 
     return {
-        "AMPLA": ordenar(df_p[df_p["conc"] == "AMPLA"]),
-        "COTA_NEGRO":  ordenar(df_p[df_p["conc"] == "COTA_NEGRO"]),
+        "AMPLA":      ordenar(df_p[df_p["conc"] == "AMPLA"]),
+        "COTA_NEGRO": ordenar(df_p[df_p["conc"] == "COTA_NEGRO"]),
         "COTA_PCD":   ordenar(df_p[df_p["conc"] == "COTA_PCD"])
     }
 
@@ -119,7 +118,7 @@ def classificar():
             r    = resp_map.get(str(c["insc"]), {})
             conc = str(c["conc"])
             class_count[conc] = class_count.get(conc, 0) + 1
-            tipo_vaga = "COTA_NEGRO" if conc == "COTA_NEGRO" else conc
+            tipo_vaga = conc  # já vem com o nome correto da planilha
             opcoes = [str(r.get(opt, "")).strip().upper() for opt in opcao_cols if r.get(opt)]
 
             res = {
@@ -156,21 +155,24 @@ def classificar():
                 res["obs"] = "Vagas esgotadas" if opcoes else "Sem escolhas registradas"
             resultados.append(res)
 
-        # CSV legado com nomes em português
         csv_rows = [{
             "Classificação":   r["posicao_geral"],
+            "Tipo":            r["tipo_vaga"],
+            "Class. no Grupo": r["classificacao"],
             "Inscrição":       r["inscricao"],
             "Nome":            r["nome"],
-            "Cota":            r["concorrencia"],
+            "Concorrência":    r["concorrencia"],
             "Situação":        r["situacao"],
+            "Pontuação":       r["pontuacao"],
+            "1ª Opção":        r["opcoes"][0] if r["opcoes"] else "",
+            "2ª Opção":        r["opcoes"][1] if len(r["opcoes"]) > 1 else "",
             "Unidade Alocada": r["unidade_alocada"],
             "Obs":             r["obs"],
         } for r in resultados]
         pd.DataFrame(csv_rows).to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
 
         return jsonify({"ok": True, "total": len(resultados), "resultado": resultados, "avisos": []})
-    except Exception:
-        return jsonify({"ok": False, "trace": traceback.format_exc()}), 500
+    _exc()}), 500
 
 @app.route("/resultado/csv")
 def dload(): return send_file(SAIDA_CSV, as_attachment=True)
