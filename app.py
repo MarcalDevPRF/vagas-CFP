@@ -400,7 +400,9 @@ def alocar(fila, resp_map, opcao_cols, saldo_vagas):
 @app.route("/health", methods=["GET"])
 def health():
     """Endpoint de verificação de saúde — usado pelo Admin para testar conexão."""
-    return jsonify({"ok": True, "status": "online"})
+    import hashlib
+    h = hashlib.md5(open(__file__, "rb").read()).hexdigest()[:8]
+    return jsonify({"ok": True, "status": "online", "version": h})
 
 
 @app.route("/classificar", methods=["POST"])
