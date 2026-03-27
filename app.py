@@ -199,11 +199,31 @@ def classificar():
         # Preparar dados
         c_unid = _col(df_v, "unidade", "nome_unidade")
         c_qtd  = _col(df_v, "vagas", "quantidade")
+
+        if c_unid is None or c_qtd is None:
+            return jsonify({
+                "ok": False,
+                "erro": (
+                    f"CSV de vagas não tem as colunas esperadas.\n"
+                    f"  Coluna unidade encontrada: {c_unid!r} (esperava 'unidade' ou 'nome_unidade')\n"
+                    f"  Coluna vagas encontrada:   {c_qtd!r} (esperava 'vagas' ou 'quantidade')\n"
+                    f"  Colunas presentes: {list(df_v.columns)}"
+                )
+            })
+
         saldo = { _norm_str(r[c_unid]): int(pd.to_numeric(r[c_qtd], errors="coerce") or 0)
                  for _, r in df_v.iterrows() if _norm_str(r[c_unid]) }
 
         if not saldo:
-            return jsonify({"ok": False, "erro": "Nenhuma unidade válida encontrada no CSV de vagas."})
+            return jsonify({
+                "ok": False,
+                "erro": (
+                    f"Nenhuma unidade válida encontrada no CSV de vagas.\n"
+                    f"  Coluna usada para unidade: {c_unid!r}\n"
+                    f"  Coluna usada para vagas:   {c_qtd!r}\n"
+                    f"  Primeiras linhas: {df_v.head(3).to_dict('records')}"
+                )
+            })
 
         # Criar mapa de respostas
         c_insc_r = _col(df_r, "inscricao_aluno", "inscricao")
