@@ -164,15 +164,29 @@ def processar_lotacao(fila_global, resp_map, opcao_cols, saldo_vagas):
 
     return regulares, subjudices
 
-# ── 3. FLASK ROUTE ──────────────────────────────────────────────────────────
+# ── 3. FLASK ROUTES ──────────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET", "HEAD"])
+def health():
+    return jsonify({"ok": True, "status": "online"})
 
 @app.route("/classificar", methods=["POST"])
 def classificar():
     try:
-        data = request.get_json(force=True)
-        df_a = pd.read_csv(io.StringIO(data["csv_alunos"]), encoding="utf-8-sig")
-        df_r = pd.read_csv(io.StringIO(data["csv_respostas"]), encoding="utf-8-sig")
-        df_v = pd.read_csv(io.StringIO(data["csv_vagas"]), encoding="utf-8-sig")
+        data = request.get_json(force=True, silent=True)
+        if data:
+            # veio JSON
+            csv_alunos    = data.get("csv_alunos", "")
+            csv_respostas = data.get("csv_respostas", "")
+            csv_vagas     = data.get("csv_vagas", "")
+        else:
+            # veio multipart/form-data (CSVs enviados como arquivos)
+            csv_alunos    = request.files.get("alunos").read().decode("utf-8-sig")
+            csv_respostas = request.files.get("respostas").read().decode("utf-8-sig")
+            csv_vagas     = request.files.get("vagas").read().decode("utf-8-sig")
+        df_a = pd.read_csv(io.StringIO(csv_alunos), encoding="utf-8-sig")
+        df_r = pd.read_csv(io.StringIO(csv_respostas), encoding="utf-8-sig")
+        df_v = pd.read_csv(io.StringIO(csv_vagas), encoding="utf-8-sig")
 
         # Preparar dados
         c_unid = _col(df_v, "unidade", "nome_unidade")
