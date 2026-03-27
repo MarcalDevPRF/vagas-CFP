@@ -1,522 +1,203 @@
-"""
-app.py — Render Service: classificação e alocação de lotação CFP
-================================================================
-Endpoint principal: POST /classificar
-Recebe multipart/form-data com:
-  - certame   : string com o nome do certame
-  - alunos    : CSV da aba Alunos_<certame>
-  - respostas : CSV da aba respostas_atual_<certame>
-  - vagas     : CSV da aba vagas_<certame>
-
-Retorna JSON:
-  { ok, total, resultado: [...], avisos: [...] }
-
-onde cada item de resultado tem:
-  posicao_geral, tipo_vaga, classificacao, inscricao, nome,
-  concorrencia, situacao, pontuacao, opcoes[], unidade_alocada, obs
-"""
-
 import io
 import os
 import traceback
-from datetime import date
-from pathlib import Path
-
 import pandas as pd
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request
 
-app   = Flask(__name__)
-WDIR  = Path("/tmp/lotacao")
-WDIR.mkdir(parents=True, exist_ok=True)
-SAIDA = WDIR / "resultado_lotacao.csv"
-# Limite generoso para receber os CSVs via JSON (até 50 MB)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
-# Limite generoso para receber os CSVs via JSON (até 50 MB)
+app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-# ── Helpers de coluna ─────────────────────────────────────────────────────────
+# ── HELPERS ──────────────────────────────────────────────────────────────────
 
 def _normalizar_col(s):
-    """Remove acentos, BOM e converte para lowercase — para comparar nomes de colunas."""
     import unicodedata
     s = str(s).strip().replace("\ufeff", "")
-    return "".join(
-        c for c in unicodedata.normalize("NFD", s.lower())
-        if unicodedata.category(c) != "Mn"
-    )
-
+    return "".join(c for c in unicodedata.normalize("NFD", s.lower())
+                   if unicodedata.category(c) != "Mn")
 
 def _col(df, *candidatos):
-    """
-    Retorna o nome real da primeira coluna que casar — somente match EXATO
-    após normalizar acentos, maiúsculas e BOM. Sem match parcial para
-    evitar que 'inscricao' case com 'inscricao_aluno' erroneamente.
-    """
     mapa = {_normalizar_col(c): c for c in df.columns}
     for n in candidatos:
         norm = _normalizar_col(n)
-        if norm in mapa:
-            return mapa[norm]
+        if norm in mapa: return mapa[norm]
     return None
 
-
 def _norm_str(v):
-    """Normaliza strings: strip + upper, trata NaN."""
-    if pd.isna(v):
-        return ""
-    return str(v).strip().upper()
+    return str(v).strip().upper() if pd.notna(v) else ""
 
-
-# ── 1. Carregar vagas ─────────────────────────────────────────────────────────
-
-def carregar_vagas(df_v):
-    """
-    Retorna dict { NOME_UNIDADE_UPPER: saldo_int }.
-    Aceita colunas 'unidade' ou 'nome_unidade'; 'vagas' ou 'quantidade'.
-    """
-    c_unid = _col(df_v, "unidade", "nome_unidade")
-    c_qtd  = _col(df_v, "vagas", "quantidade")
-    if not c_unid or not c_qtd:
-        raise ValueError("CSV de vagas precisa das colunas 'unidade' e 'vagas'.")
-    saldo = {}
-    for _, row in df_v.iterrows():
-        u = _norm_str(row[c_unid])
-        q = int(pd.to_numeric(row[c_qtd], errors="coerce") or 0)
-        if u:
-            saldo[u] = q
-    return saldo
-
-
-# ── 2. Carregar respostas ─────────────────────────────────────────────────────
-
-def carregar_respostas(df_r):
-    """
-    Retorna dict { inscricao_str: row_dict }.
-    Detecta dinamicamente quantas colunas opcao_N existem.
-    Mantém apenas a linha mais recente por inscrição (keep='last').
-    """
-    c_insc = _col(df_r, "inscricao_aluno")
-    if not c_insc:
-        raise ValueError("CSV de respostas precisa da coluna 'inscricao_aluno'.")
-
-    # Normalizar inscrição (remove .0 de int→float→str)
-    df_r = df_r.copy()
-    df_r["_insc"] = (df_r[c_insc].astype(str)
-                     .str.replace(r"\.0$", "", regex=True)
-                     .str.strip())
-
-    # Detectar colunas de opção dinamicamente
-    opcao_cols = sorted(
-        [c for c in df_r.columns if c.lower().startswith("opcao_")],
-        key=lambda x: int(x.lower().split("_")[1]) if x.lower().split("_")[1].isdigit() else 0
-    )
-
-    # Normalizar colunas de opção para UPPER
-    for col in opcao_cols:
-        df_r[col] = df_r[col].astype(str).str.strip().str.upper().replace({"NAN": "", "NONE": ""})
-
-    # Normalizar acom_conjuge (trata NÃO com e sem acento, S/N abreviados)
-    if _col(df_r, "acom_conjuge"):
-        c_acom = _col(df_r, "acom_conjuge")
-        df_r[c_acom] = (df_r[c_acom].astype(str).str.strip().str.upper()
-                        .str.normalize("NFKD")
-                        .str.encode("ascii", errors="ignore")
-                        .str.decode("ascii"))
-        # Agora está sem acento: "SIM", "NAO", "S", "N"
-
-    # Manter última resposta por inscrição
-    df_r = df_r.drop_duplicates(subset=["_insc"], keep="last")
-    return df_r.set_index("_insc").to_dict(orient="index"), opcao_cols
-
-
-# ── 3. Montar fila classificada ───────────────────────────────────────────────
-
-def _calcular_idade(nasc):
-    """Retorna idade em anos a partir de um Timestamp."""
-    if pd.isna(nasc):
-        return 0
-    hoje = date.today()
-    return hoje.year - nasc.year - ((hoje.month, hoje.day) < (nasc.month, nasc.day))
-
-
-def _montar_fila_concorrencia(df_alunos, concorrencia):
-    """
-    Para uma dada concorrência, separa REGULAR e SUBJUDICE,
-    ordena cada grupo por (nota↓, idade↓) e intercala os SUBJUDICE
-    logo após o REGULAR de nota ≤ (espelhamento).
-
-    REGRA R6: SUBJUDICE é processado ANTES do REGULAR empatado.
-    """
-    c_insc = _col(df_alunos, "inscricao_aluno")
-    c_nome = _col(df_alunos, "nome_aluno", "nome")
-    c_nota = _col(df_alunos, "pontuacao", "nota")
-    c_nasc = _col(df_alunos, "data_nascimento")
-    c_conc = _col(df_alunos, "concorrencia_aluno", "concorrencia")
-    c_sit  = _col(df_alunos, "situacao_aluno", "situacao")
-
-    sub = df_alunos[
-        df_alunos[c_conc].astype(str).str.upper().str.strip() == concorrencia
-    ].copy()
-
-    if sub.empty:
-        return []
-
-    # Calcular idade
-    if c_nasc:
-        sub["_nasc"] = pd.to_datetime(sub[c_nasc], dayfirst=True, errors="coerce")
-        sub["_idade"] = sub["_nasc"].apply(_calcular_idade)
-    else:
-        sub["_idade"] = 0
-
-    sub["_nota"] = pd.to_numeric(sub[c_nota], errors="coerce").fillna(0)
-    sub["_sit"]  = sub[c_sit].astype(str).str.upper().str.strip()
-    sub["_insc"] = sub[c_insc].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    sub["_nome"] = sub[c_nome].astype(str)
-
-    # Ordenar por nota↓, idade↓ (maior idade = prioridade = data de nascimento menor)
-    regular   = (sub[sub["_sit"] == "REGULAR"]
-                 .sort_values(["_nota", "_idade"], ascending=[False, False])
-                 .reset_index(drop=True))
-    subjudice = (sub[sub["_sit"] == "SUBJUDICE"]
-                 .sort_values(["_nota", "_idade"], ascending=[False, False])
-                 .reset_index(drop=True))
-
-    # Espelhamento: inserir SUBJUDICE logo após o REGULAR de nota imediatamente ≤
-    fila = []
-    pendentes = subjudice.to_dict("records")
-
-    for _, reg_row in regular.iterrows():
-        fila.append({
-            "insc":  reg_row["_insc"],
-            "nome":  reg_row["_nome"],
-            "nota":  reg_row["_nota"],
-            "idade": reg_row["_idade"],
-            "conc":  concorrencia,
-            "sit":   "REGULAR",
-        })
-        # Inserir SUBJUDICE cuja nota >= nota deste REGULAR (espelho)
-        ainda = []
-        for s in pendentes:
-            if s["_nota"] >= reg_row["_nota"]:
-                fila.append({
-                    "insc":  s["_insc"],
-                    "nome":  s["_nome"],
-                    "nota":  s["_nota"],
-                    "idade": s["_idade"],
-                    "conc":  concorrencia,
-                    "sit":   "SUBJUDICE",
-                })
-            else:
-                ainda.append(s)
-        pendentes = ainda
-
-    # SUBJUDICE sem espelho → final da fila
-    for s in pendentes:
-        fila.append({
-            "insc":  s["_insc"],
-            "nome":  s["_nome"],
-            "nota":  s["_nota"],
-            "idade": s["_idade"],
-            "conc":  concorrencia,
-            "sit":   "SUBJUDICE",
-        })
-
-    return fila
-
-
-def _normalizar_concorrencia(df, col_conc):
-    """
-    Normaliza valores de concorrência para os nomes canônicos,
-    aceitando nomes antigos ('COTA','PCD') e novos ('COTA_NEGRO','COTA_PCD').
-    """
-    MAPA = {
-        "AMPLA":      "AMPLA",
-        "COTA":       "COTA_NEGRO",
-        "COTA_NEGRO": "COTA_NEGRO",
-        "PCD":        "COTA_PCD",
-        "COTA_PCD":   "COTA_PCD",
-    }
-    df = df.copy()
-    df[col_conc] = (df[col_conc].astype(str).str.upper().str.strip()
-                    .map(MAPA).fillna("AMPLA"))
-    return df
-
+# ── 1. CLASSIFICAÇÃO (RELÓGIO ESTABELECIDO) ──────────────────────────────────
 
 def montar_fila_global(df_alunos):
     """
-    Aplica o relogio de cotas sobre as filas internas de cada concorrencia.
-
-    RELOGIO:
-      - COTA_NEGRO (20%): posicoes 3, 8, 13, 18 ... (pos-3) % 5 == 0
-      - COTA_PCD   (5%): posicoes 5, 25, 45, 65 ... (pos-5) % 20 == 0
-      - Demais: AMPLA
-
-    Aceita valores antigos ('COTA','PCD'), novos ('COTA_NEGRO','COTA_PCD')
-    e typos como 'COTA_PDC' — todos normalizados antes do processamento.
+    Intercala conforme: 
+    - Negros: 3, 8, 13, 18... 
+    - PcD: 5, 21, 41, 61...
     """
-    # Normalizar concorrencia: trata COTA/COTA_NEGRO e PCD/COTA_PCD/COTA_PDC
-    c_conc    = _col(df_alunos, "concorrencia_aluno", "concorrencia")
-    df_alunos = _normalizar_concorrencia(df_alunos, c_conc)
+    c_insc = _col(df_alunos, "inscricao_aluno", "inscricao")
+    c_nome = _col(df_alunos, "nome_aluno", "nome")
+    c_nota = _col(df_alunos, "pontuacao", "nota")
+    c_nasc = _col(df_alunos, "data_nascimento")
+    c_sit  = _col(df_alunos, "situacao_aluno", "situacao")
+    c_conc = _col(df_alunos, "concorrencia_aluno", "concorrencia")
 
-    fila_ampla      = _montar_fila_concorrencia(df_alunos, "AMPLA")
-    fila_cota_negro = _montar_fila_concorrencia(df_alunos, "COTA_NEGRO")
-    fila_cota_pcd   = _montar_fila_concorrencia(df_alunos, "COTA_PCD")
+    MAPA = {"AMPLA": "AMPLA", "COTA": "COTA_NEGRO", "COTA_NEGRO": "COTA_NEGRO", "PCD": "COTA_PCD", "COTA_PCD": "COTA_PCD"}
+    
+    df = df_alunos.copy()
+    df["_conc_norm"] = df[c_conc].apply(_norm_str).map(MAPA).fillna("AMPLA")
+    df["_nota"] = pd.to_numeric(df[c_nota], errors="coerce").fillna(0)
+    df["_nasc"] = pd.to_datetime(df[c_nasc], dayfirst=True, errors="coerce")
 
-    ptrs  = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
-    filas = {"AMPLA": fila_ampla, "COTA_NEGRO": fila_cota_negro, "COTA_PCD": fila_cota_pcd}
-    total = len(fila_ampla) + len(fila_cota_negro) + len(fila_cota_pcd)
+    def get_fila(cat):
+        sub = df[df["_conc_norm"] == cat].sort_values(["_nota", "_nasc"], ascending=[False, True])
+        return sub.to_dict("records")
 
+    filas = {k: get_fila(k) for k in ["AMPLA", "COTA_NEGRO", "COTA_PCD"]}
+    ptrs = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
+    
     resultado = []
+    ja_alocados = set()
+    
+    for pos in range(1, len(df) + 1):
+        if pos == 5 or (pos > 5 and (pos - 1) % 20 == 0): tipo_vaga = "COTA_PCD"
+        elif pos == 3 or (pos > 3 and (pos - 3) % 5 == 0): tipo_vaga = "COTA_NEGRO"
+        else: tipo_vaga = "AMPLA"
 
-    for pos in range(1, total + 1):
-        # Relogio: COTA_PCD tem precedencia se coincidir com COTA_NEGRO
-        if pos >= 5 and (pos - 5) % 20 == 0:
-            tipo_vez = "COTA_PCD"
-        elif pos >= 3 and (pos - 3) % 5 == 0:
-            tipo_vez = "COTA_NEGRO"
-        else:
-            tipo_vez = "AMPLA"
+        escolhido = None
+        while ptrs[tipo_vaga] < len(filas[tipo_vaga]):
+            cand = filas[tipo_vaga][ptrs[tipo_vaga]]
+            ptrs[tipo_vaga] += 1
+            if str(cand[c_insc]) not in ja_alocados:
+                escolhido = cand; break
+        
+        if not escolhido:
+            while ptrs["AMPLA"] < len(filas["AMPLA"]):
+                cand = filas["AMPLA"][ptrs["AMPLA"]]
+                ptrs["AMPLA"] += 1
+                if str(cand[c_insc]) not in ja_alocados:
+                    escolhido = cand; break
 
-        # Fallback se fila do tipo estiver esgotada
-        if ptrs[tipo_vez] >= len(filas[tipo_vez]):
-            for fallback in ["AMPLA", "COTA_NEGRO", "COTA_PCD"]:
-                if ptrs[fallback] < len(filas[fallback]):
-                    tipo_vez = fallback
-                    break
-            else:
-                break
-
-        cand = filas[tipo_vez][ptrs[tipo_vez]].copy()
-        cand["posicao_final"] = pos
-        cand["tipo_vaga"]     = tipo_vez
-        resultado.append(cand)
-        ptrs[tipo_vez] += 1
-
+        if escolhido:
+            ja_alocados.add(str(escolhido[c_insc]))
+            resultado.append({
+                "insc": str(escolhido[c_insc]),
+                "nome": str(escolhido[c_nome]),
+                "conc_origem": escolhido["_conc_norm"],
+                "situacao": _norm_str(escolhido[c_sit])
+            })
     return resultado
 
+# ── 2. ALOCAÇÃO COM REGRA DE CÔNJUGE E SUBJUDICE ────────────────────────────
 
+def processar_lotacao(fila_global, resp_map, opcao_cols, saldo_vagas):
+    regulares = []
+    subjudices = []
+    
+    # Criar um mapa rápido para consultar situação de qualquer inscrito
+    situacao_map = {insc: resp.get("situacao_aluno", "REGULAR").upper() for insc, resp in resp_map.items()}
 
-# ── 4. Alocar candidatos ──────────────────────────────────────────────────────
-
-def alocar(fila, resp_map, opcao_cols, saldo_vagas):
-    """
-    Percorre a fila na ordem de classificação e aloca cada candidato.
-
-    REGRAS:
-      R1  Ordem de processamento = posicao_final (já garantida pela fila).
-      R2  Cada alocação reduz o saldo da unidade.
-      R3  Candidato com acom_conjuge=SIM só pode ser alocado onde saldo >= vagas_necessarias.
-      R4  Cônjuge REGULAR consome +1 vaga (total 2); cônjuge SUBJUDICE não consome vaga extra.
-      R5  SUBJUDICE não consome vaga (vaga espelho).
-      R6  Dentro de cada posição, SUBJUDICE vem antes do REGULAR (garantido pelo espelhamento).
-      R7  Candidato percorre opções em ordem; aloca na primeira viável.
-      R8  Sem opção viável → NAO_ALOCADO.
-    """
-    resultados   = []
-    class_count  = {"AMPLA": 0, "COTA_NEGRO": 0, "COTA_PCD": 0}
-    avisos       = []
-
-    for cand in fila:
-        insc  = str(cand["insc"])
-        conc  = cand["conc"]
-        sit   = cand["sit"]
-        is_sub = (sit == "SUBJUDICE")
-
-        class_count[conc] = class_count.get(conc, 0) + 1
-
+    for i, cand in enumerate(fila_global):
+        insc = cand["insc"]
         resp = resp_map.get(insc, {})
+        opcoes = [_norm_str(resp.get(c)) for c in opcao_cols if _norm_str(resp.get(c))]
+        
+        # Identificação de Cônjuge
+        acom_conj = _norm_str(resp.get("acom_conjuge")) in ("SIM", "S")
+        insc_conj = _norm_str(resp.get("inscricao_conjuge"))
+        is_sub = cand["situacao"] == "SUBJUDICE"
 
-        # Opções do candidato em ordem de preferência
-        opcoes = []
-        for col in opcao_cols:
-            v = _norm_str(resp.get(col, ""))
-            if v:
-                opcoes.append(v)
+        # Regra de Custo de Vaga:
+        # Se tem cônjuge e o cônjuge NÃO é subjudice, precisa de 2 vagas.
+        # Se o cônjuge FOR subjudice, o titular só consome 1 vaga (a dele).
+        custo = 1
+        if not is_sub and acom_conj:
+            sit_conj = situacao_map.get(insc_conj, "REGULAR")
+            if sit_conj != "SUBJUDICE":
+                custo = 2
 
-        # Dados de cônjuge
-        acom_raw   = _norm_str(resp.get("acom_conjuge", ""))
-        quer_conj  = acom_raw in ("SIM", "S")
-        sit_conj   = _norm_str(resp.get("situacao_conjuge", ""))
-        conj_reg   = (sit_conj == "REGULAR")
+        # Subjudices nunca consomem saldo (custo 0)
+        if is_sub: custo = 0
 
-        # R5: SUBJUDICE não consome vaga
-        # R4: cônjuge REGULAR consome +1; cônjuge SUBJUDICE não
+        unidade_destino = ""
+        ordem_opt = ""
+
+        # 1. Tentar Opções
+        for idx, u in enumerate(opcoes):
+            if u in saldo_vagas and (is_sub or saldo_vagas[u] >= custo):
+                if not is_sub: saldo_vagas[u] -= custo
+                unidade_destino = u
+                ordem_opt = f"{idx + 1}ª Opção"
+                break
+        
+        # 2. Alocação Forçada (Garante 100% de alocação para Regulares)
+        if not unidade_destino:
+            unid_reserva = sorted(saldo_vagas.keys(), key=lambda k: saldo_vagas[k], reverse=True)[0]
+            if not is_sub: saldo_vagas[unid_reserva] -= custo
+            unidade_destino = unid_reserva
+            ordem_opt = "Ex Officio"
+
+        # Registro Principal
+        registro = {
+            "Classificação Final": i + 1,
+            "Concorrência": cand["conc_origem"],
+            "Inscrição": insc,
+            "Nome": cand["nome"],
+            "Papel": "Candidato",
+            "Lotação": unidade_destino,
+            "Ordem de Opção": ordem_opt
+        }
+
         if is_sub:
-            custo = 0
-        elif quer_conj and conj_reg:
-            custo = 2   # titular + cônjuge REGULAR
+            subjudices.append(registro)
         else:
-            custo = 1   # apenas o titular
+            regulares.append(registro)
+            # Se alocou com cônjuge, insere o acompanhante na tabela
+            if acom_conj:
+                regulares.append({
+                    "Classificação Final": i + 1,
+                    "Concorrência": "ACOMPANHANTE",
+                    "Inscrição": f"AC-{insc_conj}" if insc_conj else "S/INC",
+                    "Nome": f"ACOMPANHANTE DE {cand['nome']}",
+                    "Papel": "Acompanhante",
+                    "Lotação": unidade_destino,
+                    "Ordem de Opção": "Vaga Vinculada"
+                })
 
-        unidade_alocada = "NAO_ALOCADO"
-        obs             = ""
-        alocado         = False
+    return regulares, subjudices
 
-        if not opcoes:
-            obs = "Sem escolhas registradas"
-        else:
-            for u in opcoes:
-                saldo_atual = saldo_vagas.get(u, 0)
-
-                # R3: verificar saldo suficiente
-                # Para SUBJUDICE (custo=0): não precisa de vaga disponível
-                # mas ainda verifica se a unidade existe
-                if u not in saldo_vagas:
-                    continue
-
-                if is_sub or saldo_atual >= custo:
-                    # R2: reduzir saldo (apenas para REGULAR)
-                    if not is_sub:
-                        saldo_vagas[u] -= custo
-
-                    unidade_alocada = u
-                    if is_sub:
-                        obs = "Vaga espelho (SUBJUDICE, não consome saldo)"
-                    elif custo == 2:
-                        obs = "Alocado com cônjuge REGULAR (−2 vagas)"
-                    else:
-                        obs = "Alocado (−1 vaga)"
-                    alocado = True
-                    break
-
-            if not alocado:
-                obs = f"Vagas esgotadas em todas as {len(opcoes)} opções"
-                avisos.append(f"{cand['nome']} ({insc}): não alocado — {obs}")
-
-        resultados.append({
-            "posicao_geral":   int(cand["posicao_final"]),
-            "tipo_vaga":       conc,
-            "classificacao":   class_count[conc],
-            "inscricao":       insc,
-            "nome":            cand["nome"],
-            "concorrencia":    conc,
-            "situacao":        sit,
-            "pontuacao":       float(cand["nota"]) if pd.notna(cand["nota"]) else 0.0,
-            "opcoes":          opcoes,
-            "unidade_alocada": unidade_alocada,
-            "obs":             obs,
-        })
-
-    return resultados, avisos
-
-
-# ── 5. Rotas Flask ────────────────────────────────────────────────────────────
-
-@app.route("/health", methods=["GET"])
-def health():
-    """Endpoint de verificação de saúde — usado pelo Admin para testar conexão."""
-    import hashlib
-    h = hashlib.md5(open(__file__, "rb").read()).hexdigest()[:8]
-    return jsonify({"ok": True, "status": "online", "version": h})
-
+# ── 3. FLASK ROUTE ──────────────────────────────────────────────────────────
 
 @app.route("/classificar", methods=["POST"])
 def classificar():
-    """
-    Recebe os três CSVs como JSON (Content-Type: application/json).
-    O GAS envia via ContentService com JSON.stringify().
-
-    Payload JSON esperado:
-      {
-        "certame":       "CFP_2025_1",
-        "csv_alunos":    "<conteúdo csv>",
-        "csv_respostas": "<conteúdo csv>",
-        "csv_vagas":     "<conteúdo csv>"
-      }
-
-    Sempre retorna HTTP 200 com:
-      { ok: bool, certame, total, resultado, avisos, erro }
-    Nunca retorna HTTP 500 — erros ficam em ok:false + erro com traceback.
-    """
-    # ── PARTE 1: RECEBIMENTO ─────────────────────────────────────────────────
     try:
-        body = request.get_json(force=True, silent=True)
-        if not body:
-            return jsonify({
-                "ok":   False,
-                "erro": "Body vazio ou não é JSON válido. "
-                        f"Content-Type recebido: {request.content_type}"
-            })
+        data = request.get_json(force=True)
+        df_a = pd.read_csv(io.StringIO(data["csv_alunos"]), encoding="utf-8-sig")
+        df_r = pd.read_csv(io.StringIO(data["csv_respostas"]), encoding="utf-8-sig")
+        df_v = pd.read_csv(io.StringIO(data["csv_vagas"]), encoding="utf-8-sig")
 
-        faltando = [c for c in ("csv_alunos", "csv_respostas", "csv_vagas")
-                    if not str(body.get(c, "")).strip()]
-        if faltando:
-            return jsonify({
-                "ok":   False,
-                "erro": f"Campos JSON ausentes ou vazios: {faltando}. "
-                        f"Chaves recebidas: {list(body.keys())}"
-            })
+        # Preparar dados
+        c_unid = _col(df_v, "unidade", "nome_unidade")
+        c_qtd  = _col(df_v, "vagas", "quantidade")
+        saldo = { _norm_str(r[c_unid]): int(pd.to_numeric(r[c_qtd], errors="coerce") or 0) 
+                 for _, r in df_v.iterrows() if _norm_str(r[c_unid]) }
+        
+        # Criar mapa de respostas
+        c_insc_r = _col(df_r, "inscricao_aluno", "inscricao")
+        df_r["_insc"] = df_r[c_insc_r].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+        opt_cols = sorted([c for c in df_r.columns if c.lower().startswith("opcao_")],
+                          key=lambda x: int(''.join(filter(str.isdigit, x)) or 0))
+        resp_map = df_r.set_index("_insc").to_dict(orient="index")
 
-        certame      = str(body.get("certame",       ""))
-        texto_alunos = str(body.get("csv_alunos",    ""))
-        texto_resp   = str(body.get("csv_respostas", ""))
-        texto_vagas  = str(body.get("csv_vagas",     ""))
+        # Executar
+        fila = montar_fila_global(df_a)
+        reg, sub = processar_lotacao(fila, resp_map, opt_cols, saldo)
 
-        # Converter texto CSV → DataFrame
-        df_a = pd.read_csv(io.StringIO(texto_alunos),  encoding="utf-8-sig")
-        df_r = pd.read_csv(io.StringIO(texto_resp),    encoding="utf-8-sig")
-        df_v = pd.read_csv(io.StringIO(texto_vagas),   encoding="utf-8-sig")
-
-        app.logger.info(f"[{certame}] alunos={len(df_a)} respostas={len(df_r)} vagas={len(df_v)}")
-        app.logger.info(f"colunas alunos:    {list(df_a.columns)}")
-        app.logger.info(f"colunas respostas: {list(df_r.columns)}")
-        app.logger.info(f"colunas vagas:     {list(df_v.columns)}")
-
+        return jsonify({
+            "ok": True,
+            "tabela_regulares": reg,
+            "tabela_subjudices": sub
+        })
     except Exception:
-        tb = traceback.format_exc()
-        app.logger.error(f"RECEBIMENTO: {tb}")
-        return jsonify({"ok": False, "erro": f"Erro ao receber/parsear CSVs:\n{tb}"})
-
-    # ── PARTE 2: PROCESSAMENTO ───────────────────────────────────────────────
-    try:
-        saldo_vagas          = carregar_vagas(df_v)
-        resp_map, opcao_cols = carregar_respostas(df_r)
-        fila                 = montar_fila_global(df_a)
-        resultados, avisos   = alocar(fila, resp_map, opcao_cols, saldo_vagas)
-
-    except Exception:
-        tb = traceback.format_exc()
-        app.logger.error(f"PROCESSAMENTO: {tb}")
-        return jsonify({"ok": False, "erro": f"Erro no processamento:\n{tb}"})
-
-    # ── PARTE 3: ENVIO DA RESPOSTA ───────────────────────────────────────────
-    try:
-        pd.DataFrame([{
-            "Classificação":    r["posicao_geral"],
-            "Tipo":             r["tipo_vaga"],
-            "Class. no Grupo":  r["classificacao"],
-            "Inscrição":        r["inscricao"],
-            "Nome":             r["nome"],
-            "Concorrência":     r["concorrencia"],
-            "Situação":         r["situacao"],
-            "Pontuação":        r["pontuacao"],
-            "1ª Opção":         r["opcoes"][0] if r["opcoes"] else "",
-            "2ª Opção":         r["opcoes"][1] if len(r["opcoes"]) > 1 else "",
-            "Unidade Alocada":  r["unidade_alocada"],
-            "Obs":              r["obs"],
-        } for r in resultados]).to_csv(SAIDA, index=False, encoding="utf-8-sig")
-
-    except Exception:
-        app.logger.warning(f"Falha ao salvar CSV local: {traceback.format_exc()}")
-        # Não abortar — CSV local é opcional
-
-    return jsonify({
-        "ok":        True,
-        "certame":   certame,
-        "total":     len(resultados),
-        "resultado": resultados,
-        "avisos":    avisos,
-        "erro":      "",
-    })
-
-
-@app.route("/resultado/csv", methods=["GET"])
-def download_csv():
-    """Download do último CSV de resultado gerado."""
-    if not SAIDA.exists():
-        return jsonify({"ok": False, "erro": "Nenhum resultado disponível."}), 404
-    return send_file(SAIDA, as_attachment=True, download_name="resultado_lotacao.csv")
-
+        return jsonify({"ok": False, "erro": traceback.format_exc()})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=8000)
