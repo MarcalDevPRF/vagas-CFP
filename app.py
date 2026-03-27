@@ -81,6 +81,7 @@ def montar_fila_global(df_alunos):
             resultado.append({
                 "insc": str(escolhido[c_insc]),
                 "nome": str(escolhido[c_nome]),
+                "nota": float(escolhido["_nota"]) if pd.notna(escolhido["_nota"]) else 0,
                 "conc_origem": escolhido["_conc_norm"],
                 "situacao": _norm_str(escolhido[c_sit])
             })
@@ -145,6 +146,7 @@ def processar_lotacao(fila_global, resp_map, opcao_cols, saldo_vagas):
             "Concorrência": cand["conc_origem"],
             "Inscrição": insc,
             "Nome": cand["nome"],
+            "Nota": cand.get("nota", ""),
             "Papel": "Candidato",
             "Lotação": unidade_destino,
             "Ordem de Opção": ordem_opt
