@@ -130,10 +130,14 @@ def processar_lotacao(fila_global, resp_map, opcao_cols, saldo_vagas):
         
         # 2. Alocação Forçada (Garante 100% de alocação para Regulares)
         if not unidade_destino:
-            unid_reserva = sorted(saldo_vagas.keys(), key=lambda k: saldo_vagas[k], reverse=True)[0]
-            if not is_sub: saldo_vagas[unid_reserva] -= custo
-            unidade_destino = unid_reserva
-            ordem_opt = "Ex Officio"
+            if not saldo_vagas:
+                unidade_destino = "SEM_VAGA"
+                ordem_opt = "Sem vaga disponível"
+            else:
+                unid_reserva = sorted(saldo_vagas.keys(), key=lambda k: saldo_vagas[k], reverse=True)[0]
+                if not is_sub: saldo_vagas[unid_reserva] -= custo
+                unidade_destino = unid_reserva
+                ordem_opt = "Ex Officio"
 
         # Registro Principal
         registro = {
@@ -170,6 +174,10 @@ def processar_lotacao(fila_global, resp_map, opcao_cols, saldo_vagas):
 def health():
     return jsonify({"ok": True, "status": "online"})
 
+@app.route("/health", methods=["GET", "HEAD"])
+def health_check():
+    return jsonify({"ok": True, "status": "online"})
+
 @app.route("/classificar", methods=["POST"])
 def classificar():
     try:
@@ -191,9 +199,12 @@ def classificar():
         # Preparar dados
         c_unid = _col(df_v, "unidade", "nome_unidade")
         c_qtd  = _col(df_v, "vagas", "quantidade")
-        saldo = { _norm_str(r[c_unid]): int(pd.to_numeric(r[c_qtd], errors="coerce") or 0) 
+        saldo = { _norm_str(r[c_unid]): int(pd.to_numeric(r[c_qtd], errors="coerce") or 0)
                  for _, r in df_v.iterrows() if _norm_str(r[c_unid]) }
-        
+
+        if not saldo:
+            return jsonify({"ok": False, "erro": "Nenhuma unidade válida encontrada no CSV de vagas."})
+
         # Criar mapa de respostas
         c_insc_r = _col(df_r, "inscricao_aluno", "inscricao")
         df_r["_insc"] = df_r[c_insc_r].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
